@@ -11,6 +11,8 @@ import {
   Sparkles,
   Signal,
   UserRound,
+  AlertTriangle,
+  ExternalLink,
 } from "lucide-react";
 import { createPlayer, YT_STATE, type YTPlayer } from "@/lib/yt-loader";
 import { formatDuration, type PartySnapshot } from "@/lib/types";
@@ -40,6 +42,10 @@ export default function NowPlaying({
   const [volume, setVolume] = useState(80);
   const [displayPos, setDisplayPos] = useState(0);
   const [tilt, setTilt] = useState({ x: 0, y: 0 });
+  const [soundEnabled, setSoundEnabled] = useState(false);
+  const [playerProblem, setPlayerProblem] = useState("");
+  const [simplePlayer, setSimplePlayer] = useState(false);
+  const [simpleStartSec, setSimpleStartSec] = useState(0);
   const busyRef = useRef(false);
 
   /* ---------- compute expected position ---------- */
@@ -63,9 +69,13 @@ export default function NowPlaying({
     const expected = expectedPos();
 
     try {
-      if (np && np.videoId) {
+        if (np && np.videoId) {
         if (appliedQidRef.current !== np.queueId) {
           appliedQidRef.current = np.queueId;
+          setPlayerProblem("");
+          setSoundEnabled(false);
+          setSimplePlayer(false);
+          setSimpleStartSec(0);
           player.loadVideoById({ videoId: np.videoId, startSeconds: expected });
           if (!p.isPlaying) setTimeout(() => player.pauseVideo(), 600);
           return;
@@ -116,6 +126,14 @@ export default function NowPlaying({
           }
         }
       },
+      onError: (code) => {
+        const friendly = code === 101 || code === 150
+          ? "This YouTube video does not allow embedded playback. Skip it or choose another result."
+          : "YouTube could not play this track here. Try another version of the song.";
+        setPlayerProblem(friendly);
+      },
+    }).catch((err) => {
+      setPlayerProblem(err instanceof Error ? err.message : "YouTube player could not start.");
     });
     const t = setInterval(sync, 4000);
     return () => {
@@ -128,6 +146,18 @@ export default function NowPlaying({
   useEffect(() => {
     sync();
   }, [snap, sync]);
+
+  useEffect(() => {
+    if (!snap?.nowPlaying || ready || simplePlayer) return;
+    const t = window.setTimeout(() => {
+      if (!readyRef.current) {
+        setPlayerProblem(
+          "The advanced synced YouTube player is taking too long to load. This can happen with browser privacy settings, ad blockers, or some networks."
+        );
+      }
+    }, 6000);
+    return () => window.clearTimeout(t);
+  }, [snap?.nowPlaying, ready, simplePlayer]);
 
   /* ---------- smooth local progress ---------- */
   useEffect(() => {
@@ -147,13 +177,32 @@ export default function NowPlaying({
     return () => clearInterval(t);
   }, []);
 
+  const enableSound = () => {
+    const p = playerRef.current;
+    if (!p) return;
+    const pos = expectedPos();
+    try {
+      p.unMute();
+      p.setVolume(volume || 80);
+      p.seekTo(pos, true);
+      p.playVideo();
+      setMuted(false);
+      setSoundEnabled(true);
+    } catch {
+      // YouTube may still be buffering; the next sync tick will retry.
+      setSoundEnabled(true);
+    }
+  };
+
   const toggleMute = () => {
     const p = playerRef.current;
     if (!p) return;
     if (muted) {
       p.unMute();
       p.setVolume(volume);
+      p.playVideo();
       setMuted(false);
+      setSoundEnabled(true);
     } else {
       p.mute();
       setMuted(true);
@@ -168,9 +217,11 @@ export default function NowPlaying({
     if (v === 0) {
       p.mute();
       setMuted(true);
-    } else if (muted) {
+    } else {
       p.unMute();
+      p.playVideo();
       setMuted(false);
+      setSoundEnabled(true);
     }
   };
 
@@ -260,9 +311,20 @@ export default function NowPlaying({
         >
           <div className="relative aspect-square w-full overflow-hidden rounded-[2.25rem] bg-black shadow-[0_50px_140px_rgba(0,0,0,0.8)]">
             {/* the actual player — the living poster */}
-            <div ref={hostRef} className="absolute inset-0 [&>div]:h-full [&>div]:w-full">
+            <div ref={hostRef} className={`absolute inset-0 [&>div]:h-full [&>div]:w-full ${simplePlayer ? "hidden" : ""}`}>
               <div ref={mountRef} className="h-full w-full" />
             </div>
+
+            {simplePlayer && (
+              <iframe
+                key={np.videoId}
+                className="absolute inset-0 h-full w-full"
+                src={`https://www.youtube.com/embed/${np.videoId}?autoplay=1&controls=1&playsinline=1&rel=0&start=${simpleStartSec}`}
+                title={np.title}
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                allowFullScreen
+              />
+            )}
 
             {/* cinematic overlays */}
             <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/85 via-transparent to-black/45" />
@@ -291,6 +353,61 @@ export default function NowPlaying({
                 ))}
               </div>
             </div>
+
+            {/* browser/mobile autoplay protection: users must tap once for audio */}
+            {isPlaying && ready && !soundEnabled && !playerProblem && !simplePlayer && (
+              <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/25 backdrop-blur-[1px]">
+                <button
+                  onClick={enableSound}
+                  className="group flex items-center gap-3 rounded-2xl border border-white/15 bg-black/70 px-6 py-4 font-display text-xs font-bold uppercase tracking-[0.25em] text-white shadow-[0_0_45px_rgba(168,85,247,0.45)] transition hover:scale-105 hover:border-fuchsia-300/60"
+                >
+                  <Volume2 className="h-5 w-5 text-fuchsia-300 transition group-hover:scale-110" />
+                  Tap for sound
+                </button>
+              </div>
+            )}
+
+            {playerProblem && (
+              <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/70 p-6 text-center backdrop-blur-sm">
+                <div className="max-w-sm rounded-3xl border border-amber-300/25 bg-black/70 p-6 shadow-[0_0_50px_rgba(251,191,36,0.18)]">
+                  <AlertTriangle className="mx-auto mb-3 h-8 w-8 text-amber-300" />
+                  <p className="font-display text-sm font-bold uppercase tracking-[0.2em] text-white">
+                    YouTube blocked this player
+                  </p>
+                  <p className="mt-3 text-sm leading-relaxed text-zinc-300">{playerProblem}</p>
+                  <div className="mt-5 flex flex-col gap-2 sm:flex-row sm:justify-center">
+                    <button
+                      onClick={() => {
+                        setPlayerProblem("");
+                        sync();
+                      }}
+                      className="rounded-xl border border-white/10 bg-white/10 px-4 py-2.5 text-xs font-bold uppercase tracking-widest text-white transition hover:bg-white/15"
+                    >
+                      Try again
+                    </button>
+                    <button
+                      onClick={() => {
+                        setSimpleStartSec(Math.max(0, Math.floor(displayPos)));
+                        setSimplePlayer(true);
+                        setPlayerProblem("");
+                        setSoundEnabled(true);
+                      }}
+                      className="rounded-xl bg-gradient-to-r from-violet-500 to-fuchsia-500 px-4 py-2.5 text-xs font-bold uppercase tracking-widest text-white transition hover:shadow-[0_0_24px_rgba(217,70,239,0.35)]"
+                    >
+                      Use simple player
+                    </button>
+                    <a
+                      href={`https://www.youtube.com/watch?v=${np.videoId}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-white/10 px-4 py-2.5 text-xs font-bold uppercase tracking-widest text-white transition hover:bg-white/15"
+                    >
+                      YouTube <ExternalLink className="h-3.5 w-3.5" />
+                    </a>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* spinning vinyl chip */}
             <div className="absolute bottom-5 right-5 hidden sm:block">
@@ -389,7 +506,7 @@ export default function NowPlaying({
           </div>
         )}
 
-        {!ready && (
+        {!ready && !simplePlayer && (
           <span className="text-xs text-zinc-500">warming up the deck…</span>
         )}
       </div>
