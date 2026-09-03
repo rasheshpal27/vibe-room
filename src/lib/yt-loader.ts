@@ -43,7 +43,7 @@ function waitForYT(resolve: (yt: any) => void, reject: (err: Error) => void) {
       resolve(window.YT);
       return;
     }
-    if (Date.now() - started > 12000) {
+    if (Date.now() - started > 8000) {
       window.clearInterval(timer);
       reject(new Error("YouTube player API did not load. Check ad blockers or network restrictions."));
     }
@@ -92,7 +92,7 @@ export function createPlayer(
         let settled = false;
         const timeout = window.setTimeout(() => {
           if (!settled) reject(new Error("YouTube player iframe did not become ready."));
-        }, 12000);
+        }, 8000);
 
         const player: YTPlayer = new YT.Player(el, {
           width: "100%",
@@ -100,10 +100,10 @@ export function createPlayer(
           host: "https://www.youtube-nocookie.com",
           playerVars: {
             autoplay: 0,
-            controls: 1,
-            disablekb: 0,
+            controls: 0,
+            disablekb: 1,
             enablejsapi: 1,
-            fs: 1,
+            fs: 0,
             iv_load_policy: 3,
             modestbranding: 1,
             origin: window.location.origin,

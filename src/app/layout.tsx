@@ -28,6 +28,13 @@ export const metadata: Metadata = {
     "A private listening room. Search any song, queue it up, chat live, and let the host run the deck.",
 };
 
+export const viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+  themeColor: "#050509",
+};
+
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en" className={`${display.variable} ${body.variable} ${serif.variable}`}>

@@ -58,7 +58,7 @@ function dedupeAndFinish(items: SongResult[]): SongResult[] {
   return out;
 }
 
-async function fetchWithTimeout(url: string, ms = 6000) {
+async function fetchWithTimeout(url: string, ms = 5000) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), ms);
   try {
@@ -72,6 +72,23 @@ async function fetchWithTimeout(url: string, ms = 6000) {
   } finally {
     clearTimeout(t);
   }
+}
+
+/** Race a promise against a hard deadline. */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("timeout")), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
 }
 
 async function searchOfficial(q: string): Promise<SongResult[]> {
@@ -120,7 +137,7 @@ async function pipedQuery(q: string, filter: string): Promise<SongResult[]> {
     try {
       const data = await fetchWithTimeout(
         `${base}/search?q=${encodeURIComponent(q)}&filter=${filter}`,
-        5000
+        3500
       );
       const items: any[] = data?.items ?? [];
       const out = items
@@ -163,7 +180,7 @@ async function searchInvidious(q: string): Promise<SongResult[]> {
     try {
       const data = await fetchWithTimeout(
         `${base}/api/v1/search?q=${encodeURIComponent(q)}&type=video&page=1`,
-        5000
+        3500
       );
       const items: any[] = Array.isArray(data) ? data : [];
       const out = items
@@ -192,16 +209,22 @@ export async function searchSongs(q: string): Promise<SongResult[]> {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < CACHE_TTL) return hit.data;
 
-  let results: SongResult[] = [];
+  // Run every strategy in parallel and take the first one that returns
+  // results — far snappier than the old sequential fallback chain.
   const strategies = [searchOfficial, searchPiped, searchInvidious];
-  for (const strat of strategies) {
-    try {
-      results = await strat(q);
-      results = dedupeAndFinish(results);
-      if (results.length) break;
-    } catch {
-      // try next strategy
-    }
+  const attempts = strategies.map(async (strat) => {
+    const finished = dedupeAndFinish(await strat(q));
+    if (!finished.length) throw new Error("no results");
+    return finished;
+  });
+
+  let results: SongResult[] = [];
+  try {
+    const any = Promise.any(attempts);
+    any.catch(() => undefined); // swallow late rejections past the deadline
+    results = await withTimeout(any, 5000);
+  } catch {
+    results = [];
   }
   cache.set(key, { at: Date.now(), data: results });
   return results;

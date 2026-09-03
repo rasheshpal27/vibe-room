@@ -78,7 +78,7 @@ export default function PartyShell({
 
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, 2500);
+    const t = setInterval(refresh, 1200);
     return () => clearInterval(t);
   }, [refresh]);
 
@@ -273,8 +273,8 @@ export default function PartyShell({
       </div>
 
       {/* ---------- mobile bottom nav ---------- */}
-      <nav className="fixed bottom-0 left-0 right-0 z-40 border-t border-white/10 bg-[#08080f]/90 backdrop-blur-xl lg:hidden">
-        <div className="mx-auto grid max-w-md grid-cols-4 gap-1 px-3 py-2.5">
+      <nav className="fixed bottom-0 left-0 right-0 z-40 border-t border-white/10 bg-[#08080f]/95 backdrop-blur-xl lg:hidden">
+        <div className="mx-auto grid max-w-md grid-cols-4 gap-1 px-3 pt-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
           <NavBtn active={tab === "deck"} onClick={() => setTab("deck")} icon={<Disc3 className="h-5 w-5" />} label="Deck" playing={!!playing} />
           <NavBtn active={tab === "queue"} onClick={() => setTab("queue")} icon={<ListMusic className="h-5 w-5" />} label="Queue" badge={queueCount} />
           <NavBtn active={tab === "search"} onClick={() => setTab("search")} icon={<Search className="h-5 w-5" />} label="Discover" />
@@ -359,7 +359,7 @@ function NavBtn({
   return (
     <button
       onClick={onClick}
-      className={`relative flex flex-col items-center gap-1 rounded-2xl py-2 text-[10px] font-semibold transition ${
+      className={`relative flex min-h-[48px] flex-col items-center justify-center gap-1 rounded-2xl text-[10px] font-semibold transition active:scale-95 ${
         active ? "bg-white/10 text-white" : "text-zinc-500"
       }`}
     >
