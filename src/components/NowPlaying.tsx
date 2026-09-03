@@ -43,12 +43,9 @@ export default function NowPlaying({
   const [displayPos, setDisplayPos] = useState(0);
   const [tilt, setTilt] = useState({ x: 0, y: 0 });
   const [soundEnabled, setSoundEnabled] = useState(false);
-<<<<<<< HEAD
   const [playerProblem, setPlayerProblem] = useState("");
-  const [simplePlayer, setSimplePlayer] = useState(false);
+  const [simplePlayer, setSimplePlayer] = useState(true);
   const [simpleStartSec, setSimpleStartSec] = useState(0);
-=======
->>>>>>> e77a6b91b8ad402001a884fe2c2ec44c73cc99a0
   const busyRef = useRef(false);
 
   /* ---------- compute expected position ---------- */
@@ -66,6 +63,16 @@ export default function NowPlaying({
     const player = playerRef.current;
     const s = snapRef.current;
     if (!player || !readyRef.current || !s) return;
+
+    if (simplePlayer) {
+      try {
+        player.stopVideo();
+      } catch {
+        // ignore hidden player cleanup errors
+      }
+      return;
+    }
+
     const np = s.nowPlaying;
     const p = s.party;
     offsetRef.current = s.serverNow - Date.now();
@@ -76,9 +83,6 @@ export default function NowPlaying({
         if (appliedQidRef.current !== np.queueId) {
           appliedQidRef.current = np.queueId;
           setPlayerProblem("");
-          setSoundEnabled(false);
-          setSimplePlayer(false);
-          setSimpleStartSec(0);
           player.loadVideoById({ videoId: np.videoId, startSeconds: expected });
           if (!p.isPlaying) setTimeout(() => player.pauseVideo(), 600);
           return;
@@ -100,7 +104,7 @@ export default function NowPlaying({
     } catch {
       /* player mid-transition */
     }
-  }, [expectedPos]);
+  }, [expectedPos, simplePlayer]);
 
   /* ---------- mount player once ---------- */
   useEffect(() => {
@@ -149,6 +153,20 @@ export default function NowPlaying({
   useEffect(() => {
     sync();
   }, [snap, sync]);
+
+  useEffect(() => {
+    const current = snap?.nowPlaying;
+    if (!current) return;
+    setPlayerProblem("");
+    setSoundEnabled(true);
+    setSimplePlayer(true);
+    setSimpleStartSec(Math.max(0, Math.floor(expectedPos())));
+    try {
+      playerRef.current?.stopVideo();
+    } catch {
+      // ignore hidden player cleanup errors
+    }
+  }, [snap?.nowPlaying?.queueId, snap?.nowPlaying?.videoId, expectedPos]);
 
   useEffect(() => {
     if (!snap?.nowPlaying || ready || simplePlayer) return;
@@ -321,7 +339,7 @@ export default function NowPlaying({
             {simplePlayer && (
               <iframe
                 key={np.videoId}
-                className="absolute inset-0 h-full w-full"
+                className="absolute inset-0 z-20 h-full w-full bg-black"
                 src={`https://www.youtube.com/embed/${np.videoId}?autoplay=1&controls=1&playsinline=1&rel=0&start=${simpleStartSec}`}
                 title={np.title}
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
@@ -358,11 +376,7 @@ export default function NowPlaying({
             </div>
 
             {/* browser/mobile autoplay protection: users must tap once for audio */}
-<<<<<<< HEAD
             {isPlaying && ready && !soundEnabled && !playerProblem && !simplePlayer && (
-=======
-            {isPlaying && !soundEnabled && (
->>>>>>> e77a6b91b8ad402001a884fe2c2ec44c73cc99a0
               <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/25 backdrop-blur-[1px]">
                 <button
                   onClick={enableSound}
@@ -374,7 +388,6 @@ export default function NowPlaying({
               </div>
             )}
 
-<<<<<<< HEAD
             {playerProblem && (
               <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/70 p-6 text-center backdrop-blur-sm">
                 <div className="max-w-sm rounded-3xl border border-amber-300/25 bg-black/70 p-6 shadow-[0_0_50px_rgba(251,191,36,0.18)]">
@@ -417,8 +430,6 @@ export default function NowPlaying({
               </div>
             )}
 
-=======
->>>>>>> e77a6b91b8ad402001a884fe2c2ec44c73cc99a0
             {/* spinning vinyl chip */}
             <div className="absolute bottom-5 right-5 hidden sm:block">
               <div className={`vinyl relative h-24 w-24 rounded-full ${isPlaying ? "animate-spin-vinyl" : ""}`}>
