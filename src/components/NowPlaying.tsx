@@ -13,6 +13,7 @@ import {
   UserRound,
   AlertTriangle,
   ExternalLink,
+  LoaderCircle,
 } from "lucide-react";
 import { createPlayer, YT_STATE, type YTPlayer } from "@/lib/yt-loader";
 import { formatDuration, type PartySnapshot } from "@/lib/types";
@@ -44,9 +45,13 @@ export default function NowPlaying({
   const [tilt, setTilt] = useState({ x: 0, y: 0 });
   const [soundEnabled, setSoundEnabled] = useState(false);
   const [playerProblem, setPlayerProblem] = useState("");
-  const [simplePlayer, setSimplePlayer] = useState(true);
-  const [simpleStartSec, setSimpleStartSec] = useState(0);
+  // optimistic transport state (cleared as soon as the server confirms)
+  const [uiPlaying, setUiPlaying] = useState<boolean | null>(null);
+  // queueId currently loaded into the player — drives the "switching" overlay
+  const [loadedQid, setLoadedQid] = useState<number | null>(null);
   const busyRef = useRef(false);
+  const lastServerUpdateRef = useRef(0);
+  const scrubbingRef = useRef(false);
 
   /* ---------- compute expected position ---------- */
   const expectedPos = useCallback(() => {
@@ -64,31 +69,23 @@ export default function NowPlaying({
     const s = snapRef.current;
     if (!player || !readyRef.current || !s) return;
 
-    if (simplePlayer) {
-      try {
-        player.stopVideo();
-      } catch {
-        // ignore hidden player cleanup errors
-      }
-      return;
-    }
-
     const np = s.nowPlaying;
     const p = s.party;
     offsetRef.current = s.serverNow - Date.now();
     const expected = expectedPos();
 
     try {
-        if (np && np.videoId) {
+      if (np && np.videoId) {
         if (appliedQidRef.current !== np.queueId) {
           appliedQidRef.current = np.queueId;
+          setLoadedQid(np.queueId);
           setPlayerProblem("");
           player.loadVideoById({ videoId: np.videoId, startSeconds: expected });
-          if (!p.isPlaying) setTimeout(() => player.pauseVideo(), 600);
+          if (!p.isPlaying) setTimeout(() => player.pauseVideo(), 400);
           return;
         }
         const cur = player.getCurrentTime();
-        if (Number.isFinite(cur) && Math.abs(cur - expected) > 2.5) {
+        if (Number.isFinite(cur) && Math.abs(cur - expected) > 1.0) {
           player.seekTo(expected, true);
         }
         const st = player.getPlayerState();
@@ -99,12 +96,13 @@ export default function NowPlaying({
         }
       } else if (appliedQidRef.current !== null) {
         appliedQidRef.current = null;
+        setLoadedQid(null);
         player.stopVideo();
       }
     } catch {
       /* player mid-transition */
     }
-  }, [expectedPos, simplePlayer]);
+  }, [expectedPos]);
 
   /* ---------- mount player once ---------- */
   useEffect(() => {
@@ -142,7 +140,7 @@ export default function NowPlaying({
     }).catch((err) => {
       setPlayerProblem(err instanceof Error ? err.message : "YouTube player could not start.");
     });
-    const t = setInterval(sync, 4000);
+    const t = setInterval(sync, 1000);
     return () => {
       cancelled = true;
       clearInterval(t);
@@ -154,31 +152,26 @@ export default function NowPlaying({
     sync();
   }, [snap, sync]);
 
+  // When a fresh server state arrives, stop overriding with optimistic UI.
   useEffect(() => {
-    const current = snap?.nowPlaying;
-    if (!current) return;
-    setPlayerProblem("");
-    setSoundEnabled(true);
-    setSimplePlayer(true);
-    setSimpleStartSec(Math.max(0, Math.floor(expectedPos())));
-    try {
-      playerRef.current?.stopVideo();
-    } catch {
-      // ignore hidden player cleanup errors
+    if (!snap) return;
+    if (lastServerUpdateRef.current !== snap.party.updatedAtMs) {
+      lastServerUpdateRef.current = snap.party.updatedAtMs;
+      setUiPlaying(null);
     }
-  }, [snap?.nowPlaying?.queueId, snap?.nowPlaying?.videoId, expectedPos]);
+  }, [snap]);
 
   useEffect(() => {
-    if (!snap?.nowPlaying || ready || simplePlayer) return;
+    if (!snap?.nowPlaying || ready) return;
     const t = window.setTimeout(() => {
       if (!readyRef.current) {
         setPlayerProblem(
-          "The advanced synced YouTube player is taking too long to load. This can happen with browser privacy settings, ad blockers, or some networks."
+          "The synced YouTube player is taking too long to load. This can happen with browser privacy settings, ad blockers, or some networks."
         );
       }
     }, 6000);
     return () => window.clearTimeout(t);
-  }, [snap?.nowPlaying, ready, simplePlayer]);
+  }, [snap?.nowPlaying, ready]);
 
   /* ---------- smooth local progress ---------- */
   useEffect(() => {
@@ -188,13 +181,14 @@ export default function NowPlaying({
         setDisplayPos(0);
         return;
       }
+      if (scrubbingRef.current) return; // don't fight the host's drag
       const drift = s.party.isPlaying
         ? Math.max(0, Date.now() + offsetRef.current - s.party.updatedAtMs) / 1000
         : 0;
       const pos = s.party.positionSec + drift;
       const max = s.party.durationSec || Infinity;
       setDisplayPos(Math.min(pos, max));
-    }, 400);
+    }, 250);
     return () => clearInterval(t);
   }, []);
 
@@ -249,25 +243,55 @@ export default function NowPlaying({
   const adminTransport = async (action: string) => {
     if (busyRef.current) return;
     busyRef.current = true;
+    // Apply the change locally right away for an instant, app-like feel.
+    try {
+      if (action === "pause") {
+        setUiPlaying(false);
+        try { playerRef.current?.pauseVideo(); } catch { /* ignore */ }
+      } else if (action === "resume") {
+        setUiPlaying(true);
+        setSoundEnabled(true);
+        const p = playerRef.current;
+        if (p) {
+          try { p.seekTo(displayPos, true); p.playVideo(); } catch { /* ignore */ }
+        }
+      } else if (action === "skip") {
+        setLoadedQid(-1);
+        try { playerRef.current?.stopVideo(); } catch { /* ignore */ }
+      }
+    } catch {
+      /* ignore */
+    }
+
     try {
       if (action === "pause") await onPlayerAction("pause", { positionSec: displayPos });
       else if (action === "resume") await onPlayerAction("resume", { positionSec: displayPos });
       else await onPlayerAction(action);
+    } catch {
+      // revert optimistic UI — the next poll will reconcile everything else
+      if (action === "skip") setLoadedQid(snapRef.current?.nowPlaying?.queueId ?? null);
+      setUiPlaying(null);
     } finally {
       busyRef.current = false;
     }
   };
 
-  const seek = (sec: number) => {
+  const seekLocal = (sec: number) => {
+    scrubbingRef.current = true;
     setDisplayPos(sec);
-    playerRef.current?.seekTo(sec, true);
-    onPlayerAction("seek", { positionSec: sec });
+    try { playerRef.current?.seekTo(sec, true); } catch { /* ignore */ }
+  };
+
+  const commitSeek = (sec: number) => {
+    scrubbingRef.current = false;
+    onPlayerAction("seek", { positionSec: sec }).catch(() => undefined);
   };
 
   const np = snap?.nowPlaying ?? null;
   const duration = snap?.party.durationSec ?? 0;
-  const isPlaying = !!snap?.party.isPlaying && !!np;
+  const isPlaying = uiPlaying ?? (!!snap?.party.isPlaying && !!np);
   const progress = duration > 0 ? Math.min(1, displayPos / duration) : 0;
+  const switching = !!np && loadedQid !== np.queueId;
 
   const handleTilt = (e: React.MouseEvent<HTMLDivElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -332,20 +356,9 @@ export default function NowPlaying({
         >
           <div className="relative aspect-square w-full overflow-hidden rounded-[2.25rem] bg-black shadow-[0_50px_140px_rgba(0,0,0,0.8)]">
             {/* the actual player — the living poster */}
-            <div ref={hostRef} className={`absolute inset-0 [&>div]:h-full [&>div]:w-full ${simplePlayer ? "hidden" : ""}`}>
+            <div ref={hostRef} className="absolute inset-0 [&>div]:h-full [&>div]:w-full">
               <div ref={mountRef} className="h-full w-full" />
             </div>
-
-            {simplePlayer && (
-              <iframe
-                key={np.videoId}
-                className="absolute inset-0 z-20 h-full w-full bg-black"
-                src={`https://www.youtube.com/embed/${np.videoId}?autoplay=1&controls=1&playsinline=1&rel=0&start=${simpleStartSec}`}
-                title={np.title}
-                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                allowFullScreen
-              />
-            )}
 
             {/* cinematic overlays */}
             <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/85 via-transparent to-black/45" />
@@ -375,8 +388,20 @@ export default function NowPlaying({
               </div>
             </div>
 
+            {/* track switching / loading overlay */}
+            {switching && (
+              <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center bg-black/50">
+                <div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-black/60 px-5 py-3.5 backdrop-blur-md">
+                  <LoaderCircle className="h-5 w-5 animate-spin text-fuchsia-300" />
+                  <span className="font-display text-xs font-bold uppercase tracking-[0.25em] text-white">
+                    loading track…
+                  </span>
+                </div>
+              </div>
+            )}
+
             {/* browser/mobile autoplay protection: users must tap once for audio */}
-            {isPlaying && ready && !soundEnabled && !playerProblem && !simplePlayer && (
+            {isPlaying && ready && !soundEnabled && !playerProblem && !switching && (
               <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/25 backdrop-blur-[1px]">
                 <button
                   onClick={enableSound}
@@ -405,17 +430,6 @@ export default function NowPlaying({
                       className="rounded-xl border border-white/10 bg-white/10 px-4 py-2.5 text-xs font-bold uppercase tracking-widest text-white transition hover:bg-white/15"
                     >
                       Try again
-                    </button>
-                    <button
-                      onClick={() => {
-                        setSimpleStartSec(Math.max(0, Math.floor(displayPos)));
-                        setSimplePlayer(true);
-                        setPlayerProblem("");
-                        setSoundEnabled(true);
-                      }}
-                      className="rounded-xl bg-gradient-to-r from-violet-500 to-fuchsia-500 px-4 py-2.5 text-xs font-bold uppercase tracking-widest text-white transition hover:shadow-[0_0_24px_rgba(217,70,239,0.35)]"
-                    >
-                      Use simple player
                     </button>
                     <a
                       href={`https://www.youtube.com/watch?v=${np.videoId}`}
@@ -462,37 +476,42 @@ export default function NowPlaying({
         </div>
       </div>
 
-      {/* time row */}
-      <div className="mx-auto mt-5 flex w-full max-w-[560px] items-center gap-3 text-[11px] font-semibold tabular-nums text-zinc-500">
-        <span>{formatDuration(displayPos)}</span>
-        <div className="relative h-1 flex-1 overflow-hidden rounded-full bg-white/10">
-          <div
-            className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-violet-400 via-fuchsia-400 to-cyan-300"
-            style={{ width: `${progress * 100}%` }}
-          />
+      {/* single timeline — draggable for the host, read-only for guests */}
+      <div className="mx-auto mt-5 w-full max-w-[560px]">
+        <div className="flex items-center justify-between text-[11px] font-semibold tabular-nums text-zinc-500">
+          <span>{formatDuration(displayPos)}</span>
+          <span>{formatDuration(duration)}</span>
         </div>
-        <span>{formatDuration(duration)}</span>
+        {isAdmin && duration > 0 ? (
+          <input
+            type="range"
+            min={0}
+            max={duration}
+            step={1}
+            value={Math.floor(displayPos)}
+            onChange={(e) => seekLocal(Number(e.target.value))}
+            onPointerUp={(e) => commitSeek(Number((e.target as HTMLInputElement).value))}
+            onBlur={(e) => commitSeek(Number((e.target as HTMLInputElement).value))}
+            className="vibe-range mt-2.5 block w-full"
+            style={{ ["--fill" as string]: `${progress * 100}%` }}
+            aria-label="Seek"
+          />
+        ) : (
+          <div className="relative mt-2.5 h-1.5 overflow-hidden rounded-full bg-white/10">
+            <div
+              className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-violet-400 via-fuchsia-400 to-cyan-300"
+              style={{ width: `${progress * 100}%` }}
+            />
+          </div>
+        )}
       </div>
-
-      {/* admin seek */}
-      {isAdmin && duration > 0 && (
-        <input
-          type="range"
-          min={0}
-          max={duration}
-          value={Math.floor(displayPos)}
-          onChange={(e) => seek(Number(e.target.value))}
-          className="vibe-range mx-auto mt-3 block w-full max-w-[560px]"
-          style={{ ["--fill" as string]: `${progress * 100}%` }}
-        />
-      )}
 
       {/* controls */}
       <div className="mx-auto mt-5 flex w-full max-w-[560px] items-center justify-center gap-3">
         <div className="glass flex items-center gap-1 rounded-2xl p-1.5">
           <button
             onClick={toggleMute}
-            className="flex h-11 w-11 items-center justify-center rounded-xl text-zinc-300 transition hover:bg-white/10 hover:text-white"
+            className="flex h-12 w-12 items-center justify-center rounded-xl text-zinc-300 transition hover:bg-white/10 hover:text-white"
             title={muted ? "Unmute" : "Mute"}
           >
             {muted ? <VolumeX className="h-5 w-5" /> : <Volume2 className="h-5 w-5" />}
@@ -505,6 +524,7 @@ export default function NowPlaying({
             onChange={(e) => changeVolume(Number(e.target.value))}
             className="vibe-range hidden w-24 sm:block"
             style={{ ["--fill" as string]: `${muted ? 0 : volume}%` }}
+            aria-label="Volume"
           />
         </div>
 
@@ -512,14 +532,14 @@ export default function NowPlaying({
           <div className="glass flex items-center gap-1 rounded-2xl p-1.5">
             <button
               onClick={() => adminTransport(isPlaying ? "pause" : "resume")}
-              className="flex h-11 w-14 items-center justify-center rounded-xl bg-gradient-to-r from-violet-500 to-fuchsia-500 text-white shadow-[0_0_24px_rgba(168,85,247,0.4)] transition hover:scale-105"
+              className="flex h-12 w-16 items-center justify-center rounded-xl bg-gradient-to-r from-violet-500 to-fuchsia-500 text-white shadow-[0_0_24px_rgba(168,85,247,0.4)] transition hover:scale-105"
               title={isPlaying ? "Pause for everyone" : "Play for everyone"}
             >
               {isPlaying ? <Pause className="h-5 w-5" /> : <Play className="ml-0.5 h-5 w-5" />}
             </button>
             <button
               onClick={() => adminTransport("skip")}
-              className="flex h-11 w-11 items-center justify-center rounded-xl text-zinc-300 transition hover:bg-white/10 hover:text-white"
+              className="flex h-12 w-12 items-center justify-center rounded-xl text-zinc-300 transition hover:bg-white/10 hover:text-white"
               title="Skip track"
             >
               <SkipForward className="h-5 w-5" />
@@ -527,7 +547,7 @@ export default function NowPlaying({
           </div>
         )}
 
-        {!ready && !simplePlayer && (
+        {!ready && (
           <span className="text-xs text-zinc-500">warming up the deck…</span>
         )}
       </div>

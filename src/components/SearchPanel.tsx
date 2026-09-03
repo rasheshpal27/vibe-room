@@ -81,7 +81,7 @@ export default function SearchPanel({
       return;
     }
     setActiveMood(null);
-    debounceRef.current = setTimeout(() => runSearch(q, null), 450);
+    debounceRef.current = setTimeout(() => runSearch(q, null), 300);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
