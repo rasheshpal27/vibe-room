@@ -43,9 +43,12 @@ export default function NowPlaying({
   const [displayPos, setDisplayPos] = useState(0);
   const [tilt, setTilt] = useState({ x: 0, y: 0 });
   const [soundEnabled, setSoundEnabled] = useState(false);
+<<<<<<< HEAD
   const [playerProblem, setPlayerProblem] = useState("");
   const [simplePlayer, setSimplePlayer] = useState(false);
   const [simpleStartSec, setSimpleStartSec] = useState(0);
+=======
+>>>>>>> e77a6b91b8ad402001a884fe2c2ec44c73cc99a0
   const busyRef = useRef(false);
 
   /* ---------- compute expected position ---------- */
@@ -355,7 +358,11 @@ export default function NowPlaying({
             </div>
 
             {/* browser/mobile autoplay protection: users must tap once for audio */}
+<<<<<<< HEAD
             {isPlaying && ready && !soundEnabled && !playerProblem && !simplePlayer && (
+=======
+            {isPlaying && !soundEnabled && (
+>>>>>>> e77a6b91b8ad402001a884fe2c2ec44c73cc99a0
               <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/25 backdrop-blur-[1px]">
                 <button
                   onClick={enableSound}
@@ -367,6 +374,7 @@ export default function NowPlaying({
               </div>
             )}
 
+<<<<<<< HEAD
             {playerProblem && (
               <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/70 p-6 text-center backdrop-blur-sm">
                 <div className="max-w-sm rounded-3xl border border-amber-300/25 bg-black/70 p-6 shadow-[0_0_50px_rgba(251,191,36,0.18)]">
@@ -409,6 +417,8 @@ export default function NowPlaying({
               </div>
             )}
 
+=======
+>>>>>>> e77a6b91b8ad402001a884fe2c2ec44c73cc99a0
             {/* spinning vinyl chip */}
             <div className="absolute bottom-5 right-5 hidden sm:block">
               <div className={`vinyl relative h-24 w-24 rounded-full ${isPlaying ? "animate-spin-vinyl" : ""}`}>
