@@ -40,6 +40,7 @@ export default function NowPlaying({
   const [volume, setVolume] = useState(80);
   const [displayPos, setDisplayPos] = useState(0);
   const [tilt, setTilt] = useState({ x: 0, y: 0 });
+  const [soundEnabled, setSoundEnabled] = useState(false);
   const busyRef = useRef(false);
 
   /* ---------- compute expected position ---------- */
@@ -147,13 +148,32 @@ export default function NowPlaying({
     return () => clearInterval(t);
   }, []);
 
+  const enableSound = () => {
+    const p = playerRef.current;
+    if (!p) return;
+    const pos = expectedPos();
+    try {
+      p.unMute();
+      p.setVolume(volume || 80);
+      p.seekTo(pos, true);
+      p.playVideo();
+      setMuted(false);
+      setSoundEnabled(true);
+    } catch {
+      // YouTube may still be buffering; the next sync tick will retry.
+      setSoundEnabled(true);
+    }
+  };
+
   const toggleMute = () => {
     const p = playerRef.current;
     if (!p) return;
     if (muted) {
       p.unMute();
       p.setVolume(volume);
+      p.playVideo();
       setMuted(false);
+      setSoundEnabled(true);
     } else {
       p.mute();
       setMuted(true);
@@ -168,9 +188,11 @@ export default function NowPlaying({
     if (v === 0) {
       p.mute();
       setMuted(true);
-    } else if (muted) {
+    } else {
       p.unMute();
+      p.playVideo();
       setMuted(false);
+      setSoundEnabled(true);
     }
   };
 
@@ -291,6 +313,19 @@ export default function NowPlaying({
                 ))}
               </div>
             </div>
+
+            {/* browser/mobile autoplay protection: users must tap once for audio */}
+            {isPlaying && !soundEnabled && (
+              <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/25 backdrop-blur-[1px]">
+                <button
+                  onClick={enableSound}
+                  className="group flex items-center gap-3 rounded-2xl border border-white/15 bg-black/70 px-6 py-4 font-display text-xs font-bold uppercase tracking-[0.25em] text-white shadow-[0_0_45px_rgba(168,85,247,0.45)] transition hover:scale-105 hover:border-fuchsia-300/60"
+                >
+                  <Volume2 className="h-5 w-5 text-fuchsia-300 transition group-hover:scale-110" />
+                  Tap for sound
+                </button>
+              </div>
+            )}
 
             {/* spinning vinyl chip */}
             <div className="absolute bottom-5 right-5 hidden sm:block">
