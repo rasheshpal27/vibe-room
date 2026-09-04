@@ -52,6 +52,7 @@ export default function NowPlaying({
   const busyRef = useRef(false);
   const lastServerUpdateRef = useRef(0);
   const scrubbingRef = useRef(false);
+  const creatingRef = useRef(false);
 
   /* ---------- compute expected position ---------- */
   const expectedPos = useCallback(() => {
@@ -104,14 +105,13 @@ export default function NowPlaying({
     }
   }, [expectedPos]);
 
-  /* ---------- mount player once ---------- */
-  useEffect(() => {
+  /* ---------- create the player (once the container exists) ---------- */
+  const mountPlayer = useCallback(() => {
     const el = mountRef.current;
-    if (!el) return;
-    let cancelled = false;
+    if (!el || playerRef.current || creatingRef.current) return;
+    creatingRef.current = true;
     createPlayer(el, {
       onReady: (p) => {
-        if (cancelled) return;
         playerRef.current = p;
         readyRef.current = true;
         p.setVolume(80);
@@ -137,16 +137,42 @@ export default function NowPlaying({
           : "YouTube could not play this track here. Try another version of the song.";
         setPlayerProblem(friendly);
       },
-    }).catch((err) => {
-      setPlayerProblem(err instanceof Error ? err.message : "YouTube player could not start.");
-    });
+    })
+      .catch((err) => {
+        playerRef.current = null;
+        setPlayerProblem(err instanceof Error ? err.message : "YouTube player could not start.");
+      })
+      .finally(() => {
+        creatingRef.current = false;
+      });
+  }, [sync]);
+
+  // The player container only exists once a track is showing, so (re)try
+  // mounting whenever a track appears or changes. This fixes the "first song
+  // queued into an empty room never loads" hang.
+  useEffect(() => {
+    mountPlayer();
+  }, [snap?.nowPlaying?.queueId, snap?.nowPlaying?.videoId, mountPlayer]);
+
+  // If the deck is emptied (reset / end party) the container unmounts, so drop
+  // the dead player reference and let the next track re-create it fresh.
+  useEffect(() => {
+    if (snap?.nowPlaying) return;
+    if (playerRef.current || readyRef.current) {
+      try { playerRef.current?.destroy(); } catch { /* ignore */ }
+      playerRef.current = null;
+      readyRef.current = false;
+      appliedQidRef.current = null;
+      setReady(false);
+      setLoadedQid(null);
+    }
+  }, [snap?.nowPlaying]);
+
+  // keep the player tightly synced with the server
+  useEffect(() => {
     const t = setInterval(sync, 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    return () => clearInterval(t);
+  }, [sync]);
 
   useEffect(() => {
     sync();
@@ -425,7 +451,9 @@ export default function NowPlaying({
                     <button
                       onClick={() => {
                         setPlayerProblem("");
-                        sync();
+                        appliedQidRef.current = null; // force a reload of this track
+                        if (!playerRef.current) mountPlayer();
+                        else sync();
                       }}
                       className="rounded-xl border border-white/10 bg-white/10 px-4 py-2.5 text-xs font-bold uppercase tracking-widest text-white transition hover:bg-white/15"
                     >
