@@ -18,6 +18,11 @@ import {
 import { createPlayer, YT_STATE, type YTPlayer } from "@/lib/yt-loader";
 import { formatDuration, type PartySnapshot } from "@/lib/types";
 
+// How far off the player may drift from the shared timeline before we nudge it.
+const SEEK_TOLERANCE_SEC = 1.0;
+// Minimum time between two corrective seeks (avoids stutter loops).
+const SEEK_COOLDOWN_MS = 1500;
+
 export default function NowPlaying({
   snap,
   isAdmin,
@@ -29,12 +34,13 @@ export default function NowPlaying({
   onPlayerAction: (action: string, extra?: Record<string, unknown>) => Promise<void>;
   onGoDiscover: () => void;
 }) {
-  const hostRef = useRef<HTMLDivElement | null>(null);
   const mountRef = useRef<HTMLDivElement | null>(null);
-  const playerRef = useRef<YTPlayer | null>(null);
+  const preloadMountRef = useRef<HTMLDivElement | null>(null);
+  const playerRef = useRef<YTPlayer | null>(null); // the visible player
+  const preloadRef = useRef<YTPlayer | null>(null); // hidden, holds the next track
   const readyRef = useRef(false);
   const appliedQidRef = useRef<number | null>(null);
-  const offsetRef = useRef(0); // serverNow - Date.now()
+  const offsetRef = useRef(0); // serverClock - localClock (RTT corrected)
   const snapRef = useRef<PartySnapshot | null>(null);
   snapRef.current = snap;
 
@@ -47,24 +53,220 @@ export default function NowPlaying({
   const [playerProblem, setPlayerProblem] = useState("");
   // optimistic transport state (cleared as soon as the server confirms)
   const [uiPlaying, setUiPlaying] = useState<boolean | null>(null);
-  // queueId currently loaded into the player — drives the "switching" overlay
+  // queueId currently loaded into the visible player — drives the "switching" overlay
   const [loadedQid, setLoadedQid] = useState<number | null>(null);
+
   const busyRef = useRef(false);
   const lastServerUpdateRef = useRef(0);
   const scrubbingRef = useRef(false);
   const creatingRef = useRef(false);
+  const preloadCreatingRef = useRef(false);
+  const preloadReadyRef = useRef(false);
+  const preloadVideoRef = useRef<string | null>(null);
+  const pendingSeekRef = useRef(false);
+  const lastSeekAtRef = useRef(0);
+  const soundEnabledRef = useRef(false);
+  const volumeRef = useRef(80);
+  const bestRttRef = useRef(Infinity);
+  const clockSyncedRef = useRef(false);
+  const onPlayerActionRef = useRef(onPlayerAction);
 
-  /* ---------- compute expected position ---------- */
+  // keep the latest prop/state available to interval + event callbacks
+  useEffect(() => {
+    volumeRef.current = volume;
+  }, [volume]);
+  useEffect(() => {
+    onPlayerActionRef.current = onPlayerAction;
+  }, [onPlayerAction]);
+
+  /* ---------- server-relative "now" (RTT-compensated clock) ---------- */
+  const serverNow = useCallback(() => Date.now() + offsetRef.current, []);
+
+  /* ---------- compute expected position on the shared timeline ---------- */
   const expectedPos = useCallback(() => {
     const s = snapRef.current;
     if (!s) return 0;
     const drift = s.party.isPlaying
-      ? Math.max(0, s.serverNow - s.party.updatedAtMs) / 1000
+      ? Math.max(0, (serverNow() - s.party.updatedAtMs) / 1000)
       : 0;
     return s.party.positionSec + drift;
+  }, [serverNow]);
+
+  /* ---------- NTP-style clock sync against the app server ---------- */
+  useEffect(() => {
+    let cancelled = false;
+    const sample = async () => {
+      try {
+        const t0 = performance.now();
+        const res = await fetch("/api/time", { cache: "no-store" });
+        const t1 = performance.now();
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as { t?: number };
+        if (!Number.isFinite(data.t)) return;
+        const rtt = t1 - t0;
+        // serverTime at receive ≈ t + rtt/2; offset maps local→server time.
+        const offset = (data.t as number) + rtt / 2 - Date.now();
+        // keep the lowest-RTT sample (most accurate), like NTP
+        if (!clockSyncedRef.current || rtt < bestRttRef.current) {
+          bestRttRef.current = rtt;
+          offsetRef.current = offset;
+          clockSyncedRef.current = true;
+        }
+      } catch {
+        /* keep previous offset */
+      }
+    };
+    sample();
+    const iv = window.setInterval(sample, 20000);
+    const onVis = () => {
+      if (document.visibilityState === "visible") sample();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      cancelled = true;
+      window.clearInterval(iv);
+      document.removeEventListener("visibilitychange", onVis);
+    };
   }, []);
 
-  /* ---------- sync player with server ---------- */
+  // Fallback until the first clock sample lands: use the snapshot timestamp.
+  useEffect(() => {
+    if (!snap || clockSyncedRef.current) return;
+    offsetRef.current = snap.serverNow - Date.now();
+  }, [snap]);
+
+  /* ---------- shared player event handlers (both players) ---------- */
+  const handleStateChange = useCallback(
+    (state: number, target?: YTPlayer) => {
+      // only react to the visible player, never the hidden preload player
+      if (target && target !== playerRef.current) return;
+      if (state === YT_STATE.ENDED) {
+        const s = snapRef.current;
+        const qid = appliedQidRef.current;
+        if (s?.nowPlaying && qid) {
+          // let the server advance, then refresh immediately for a fast swap
+          onPlayerActionRef.current("ended", { queueId: qid }).catch(() => undefined);
+        }
+        return;
+      }
+      // one precise seek once the freshly loaded track is actually playable
+      if (
+        (state === YT_STATE.PLAYING || state === YT_STATE.PAUSED) &&
+        pendingSeekRef.current
+      ) {
+        pendingSeekRef.current = false;
+        const p = playerRef.current;
+        if (p && snapRef.current?.nowPlaying) {
+          try {
+            p.seekTo(expectedPos(), true);
+            lastSeekAtRef.current = Date.now();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    },
+    [expectedPos]
+  );
+
+  const handleError = useCallback((code: number, target?: YTPlayer) => {
+    if (target && target !== playerRef.current) return;
+    const friendly =
+      code === 101 || code === 150
+        ? "This YouTube video does not allow embedded playback. Skip it or choose another result."
+        : "YouTube could not play this track here. Try another version of the song.";
+    setPlayerProblem(friendly);
+  }, []);
+
+  /* ---------- hidden player that preloads the next queued track ---------- */
+  const ensurePreloadPlayer = useCallback(() => {
+    const el = preloadMountRef.current;
+    if (!el || preloadRef.current || preloadCreatingRef.current) return;
+    preloadCreatingRef.current = true;
+    createPlayer(el, {
+      onReady: (pre) => {
+        preloadRef.current = pre;
+        preloadReadyRef.current = true;
+        try {
+          pre.mute();
+        } catch {
+          /* ignore */
+        }
+        const next = snapRef.current?.queue?.[0];
+        if (next && preloadVideoRef.current !== next.videoId) {
+          preloadVideoRef.current = next.videoId;
+          try {
+            pre.loadVideoById({ videoId: next.videoId });
+          } catch {
+            /* ignore */
+          }
+        }
+      },
+      onStateChange: handleStateChange,
+      onError: handleError,
+    })
+      .catch(() => {
+        preloadRef.current = null;
+      })
+      .finally(() => {
+        preloadCreatingRef.current = false;
+      });
+  }, [handleStateChange, handleError]);
+
+  // keep the hidden player primed with the next track whenever the queue changes
+  useEffect(() => {
+    const next = snap?.queue?.[0];
+    if (!next) return;
+    ensurePreloadPlayer();
+    const pre = preloadRef.current;
+    if (pre && preloadReadyRef.current && preloadVideoRef.current !== next.videoId) {
+      preloadVideoRef.current = next.videoId;
+      try {
+        pre.mute();
+        pre.loadVideoById({ videoId: next.videoId });
+      } catch {
+        /* ignore */
+      }
+    }
+  }, [snap?.queue, snap?.nowPlaying?.queueId, ensurePreloadPlayer]);
+
+  /* ---------- promote the preloaded player into the visible slot ---------- */
+  const swapPlayers = useCallback(() => {
+    const main = playerRef.current;
+    const pre = preloadRef.current;
+    const mainMount = mountRef.current;
+    const preMount = preloadMountRef.current;
+    if (!main || !pre || !mainMount || !preMount) return false;
+    try {
+      const preIframe = pre.getIframe();
+      const mainIframe = main.getIframe();
+      if (!preIframe || !mainIframe) return false;
+      mainMount.appendChild(preIframe);
+      preMount.appendChild(mainIframe);
+    } catch {
+      return false;
+    }
+    // swap logical references — the old visible player becomes the hidden one
+    playerRef.current = pre;
+    preloadRef.current = main;
+    preloadVideoRef.current = null;
+    preloadReadyRef.current = true;
+
+    // re-prime the (now hidden) old player with the following track
+    const next = snapRef.current?.queue?.[0];
+    if (next) {
+      preloadVideoRef.current = next.videoId;
+      try {
+        main.mute();
+        main.loadVideoById({ videoId: next.videoId });
+      } catch {
+        /* ignore */
+      }
+    }
+    return true;
+  }, []);
+
+  /* ---------- sync the visible player with the server ---------- */
   const sync = useCallback(() => {
     const player = playerRef.current;
     const s = snapRef.current;
@@ -72,7 +274,6 @@ export default function NowPlaying({
 
     const np = s.nowPlaying;
     const p = s.party;
-    offsetRef.current = s.serverNow - Date.now();
     const expected = expectedPos();
 
     try {
@@ -81,19 +282,57 @@ export default function NowPlaying({
           appliedQidRef.current = np.queueId;
           setLoadedQid(np.queueId);
           setPlayerProblem("");
-          player.loadVideoById({ videoId: np.videoId, startSeconds: expected });
-          if (!p.isPlaying) setTimeout(() => player.pauseVideo(), 400);
+
+          const pre = preloadRef.current;
+          const canSwap =
+            pre && preloadReadyRef.current && preloadVideoRef.current === np.videoId;
+
+          if (canSwap && swapPlayers()) {
+            const main = playerRef.current;
+            if (main) {
+              try {
+                main.unMute();
+                main.setVolume(volumeRef.current);
+                main.seekTo(expected, true);
+                if (p.isPlaying) main.playVideo();
+                else main.pauseVideo();
+              } catch {
+                /* ignore */
+              }
+            }
+          } else {
+            player.loadVideoById({ videoId: np.videoId, startSeconds: expected });
+            if (!p.isPlaying) setTimeout(() => player.pauseVideo(), 400);
+          }
+          pendingSeekRef.current = true;
           return;
         }
-        const cur = player.getCurrentTime();
-        if (Number.isFinite(cur) && Math.abs(cur - expected) > 1.0) {
-          player.seekTo(expected, true);
-        }
+
         const st = player.getPlayerState();
-        if (p.isPlaying && st !== YT_STATE.PLAYING && st !== YT_STATE.BUFFERING) {
-          player.playVideo();
-        } else if (!p.isPlaying && (st === YT_STATE.PLAYING || st === YT_STATE.BUFFERING)) {
-          player.pauseVideo();
+
+        // play/pause alignment — never attempt autoplay until the user has
+        // unlocked sound, and never seek while buffering.
+        if (p.isPlaying && soundEnabledRef.current) {
+          if (st !== YT_STATE.PLAYING && st !== YT_STATE.BUFFERING) {
+            player.playVideo();
+          }
+        } else if (!p.isPlaying) {
+          if (st === YT_STATE.PLAYING || st === YT_STATE.BUFFERING) {
+            player.pauseVideo();
+          }
+        }
+
+        // corrective seek, cooled & only when the player is actually settled
+        if (st === YT_STATE.PLAYING || st === YT_STATE.PAUSED) {
+          const cur = player.getCurrentTime();
+          if (
+            Number.isFinite(cur) &&
+            Math.abs(cur - expected) > SEEK_TOLERANCE_SEC &&
+            Date.now() - lastSeekAtRef.current > SEEK_COOLDOWN_MS
+          ) {
+            player.seekTo(expected, true);
+            lastSeekAtRef.current = Date.now();
+          }
         }
       } else if (appliedQidRef.current !== null) {
         appliedQidRef.current = null;
@@ -103,9 +342,9 @@ export default function NowPlaying({
     } catch {
       /* player mid-transition */
     }
-  }, [expectedPos]);
+  }, [expectedPos, swapPlayers]);
 
-  /* ---------- create the player (once the container exists) ---------- */
+  /* ---------- create the visible player (once the container exists) ---------- */
   const mountPlayer = useCallback(() => {
     const el = mountRef.current;
     if (!el || playerRef.current || creatingRef.current) return;
@@ -114,29 +353,12 @@ export default function NowPlaying({
       onReady: (p) => {
         playerRef.current = p;
         readyRef.current = true;
-        p.setVolume(80);
+        p.setVolume(volumeRef.current);
         setReady(true);
         sync();
       },
-      onStateChange: (state) => {
-        if (state === YT_STATE.ENDED) {
-          const s = snapRef.current;
-          const qid = appliedQidRef.current;
-          if (s?.nowPlaying && qid) {
-            fetch("/api/player", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ action: "ended", queueId: qid }),
-            }).catch(() => undefined);
-          }
-        }
-      },
-      onError: (code) => {
-        const friendly = code === 101 || code === 150
-          ? "This YouTube video does not allow embedded playback. Skip it or choose another result."
-          : "YouTube could not play this track here. Try another version of the song.";
-        setPlayerProblem(friendly);
-      },
+      onStateChange: handleStateChange,
+      onError: handleError,
     })
       .catch((err) => {
         playerRef.current = null;
@@ -145,11 +367,10 @@ export default function NowPlaying({
       .finally(() => {
         creatingRef.current = false;
       });
-  }, [sync]);
+  }, [handleStateChange, handleError, sync]);
 
   // The player container only exists once a track is showing, so (re)try
-  // mounting whenever a track appears or changes. This fixes the "first song
-  // queued into an empty room never loads" hang.
+  // mounting whenever a track appears or changes.
   useEffect(() => {
     mountPlayer();
   }, [snap?.nowPlaying?.queueId, snap?.nowPlaying?.videoId, mountPlayer]);
@@ -165,12 +386,20 @@ export default function NowPlaying({
       appliedQidRef.current = null;
       setReady(false);
       setLoadedQid(null);
+      setSoundEnabled(false);
+      soundEnabledRef.current = false;
+    }
+    if (preloadRef.current) {
+      try { preloadRef.current.destroy(); } catch { /* ignore */ }
+      preloadRef.current = null;
+      preloadReadyRef.current = false;
+      preloadVideoRef.current = null;
     }
   }, [snap?.nowPlaying]);
 
   // keep the player tightly synced with the server
   useEffect(() => {
-    const t = setInterval(sync, 1000);
+    const t = setInterval(sync, 750);
     return () => clearInterval(t);
   }, [sync]);
 
@@ -209,14 +438,14 @@ export default function NowPlaying({
       }
       if (scrubbingRef.current) return; // don't fight the host's drag
       const drift = s.party.isPlaying
-        ? Math.max(0, Date.now() + offsetRef.current - s.party.updatedAtMs) / 1000
+        ? Math.max(0, (serverNow() - s.party.updatedAtMs) / 1000)
         : 0;
       const pos = s.party.positionSec + drift;
       const max = s.party.durationSec || Infinity;
       setDisplayPos(Math.min(pos, max));
     }, 250);
     return () => clearInterval(t);
-  }, []);
+  }, [serverNow]);
 
   const enableSound = () => {
     const p = playerRef.current;
@@ -224,14 +453,16 @@ export default function NowPlaying({
     const pos = expectedPos();
     try {
       p.unMute();
-      p.setVolume(volume || 80);
+      p.setVolume(volumeRef.current || 80);
       p.seekTo(pos, true);
       p.playVideo();
       setMuted(false);
       setSoundEnabled(true);
+      soundEnabledRef.current = true;
     } catch {
       // YouTube may still be buffering; the next sync tick will retry.
       setSoundEnabled(true);
+      soundEnabledRef.current = true;
     }
   };
 
@@ -240,10 +471,11 @@ export default function NowPlaying({
     if (!p) return;
     if (muted) {
       p.unMute();
-      p.setVolume(volume);
+      p.setVolume(volumeRef.current);
       p.playVideo();
       setMuted(false);
       setSoundEnabled(true);
+      soundEnabledRef.current = true;
     } else {
       p.mute();
       setMuted(true);
@@ -263,6 +495,7 @@ export default function NowPlaying({
       p.playVideo();
       setMuted(false);
       setSoundEnabled(true);
+      soundEnabledRef.current = true;
     }
   };
 
@@ -277,6 +510,7 @@ export default function NowPlaying({
       } else if (action === "resume") {
         setUiPlaying(true);
         setSoundEnabled(true);
+        soundEnabledRef.current = true;
         const p = playerRef.current;
         if (p) {
           try { p.seekTo(displayPos, true); p.playVideo(); } catch { /* ignore */ }
@@ -326,36 +560,52 @@ export default function NowPlaying({
     setTilt({ x: y, y: x });
   };
 
+  /* hidden 1px host for the preload player (must stay in the DOM) */
+  const preloadHost = (
+    <div
+      ref={preloadMountRef}
+      aria-hidden
+      className="pointer-events-none absolute h-px w-px overflow-hidden opacity-0"
+    >
+      <div className="h-full w-full" />
+    </div>
+  );
+
   /* =================== EMPTY STATE =================== */
   if (!np) {
     return (
-      <div className="glass-deep relative mx-auto flex aspect-square w-full max-w-[560px] flex-col items-center justify-center overflow-hidden rounded-[2.4rem] p-8 text-center animate-fade-up">
-        <div className="vinyl animate-spin-slow absolute h-[120%] w-[120%] rounded-full opacity-20" />
-        <div className="relative z-10">
-          <div className="mx-auto mb-6 flex h-20 w-20 animate-float-y items-center justify-center rounded-3xl bg-gradient-to-br from-violet-500/20 to-fuchsia-500/20">
-            <Disc3 className="h-10 w-10 animate-spin-slow text-violet-300" strokeWidth={1.4} />
+      <>
+        {preloadHost}
+        <div className="glass-deep relative mx-auto flex aspect-square w-full max-w-[560px] flex-col items-center justify-center overflow-hidden rounded-[2.4rem] p-8 text-center animate-fade-up">
+          <div className="vinyl animate-spin-slow absolute h-[120%] w-[120%] rounded-full opacity-20" />
+          <div className="relative z-10">
+            <div className="mx-auto mb-6 flex h-20 w-20 animate-float-y items-center justify-center rounded-3xl bg-gradient-to-br from-violet-500/20 to-fuchsia-500/20">
+              <Disc3 className="h-10 w-10 animate-spin-slow text-violet-300" strokeWidth={1.4} />
+            </div>
+            <h2 className="font-display text-2xl font-bold text-white sm:text-3xl">
+              The deck is waiting
+            </h2>
+            <p className="mx-auto mt-3 max-w-xs font-serif text-lg italic text-zinc-400">
+              be the one who drops the first track
+            </p>
+            <button
+              onClick={onGoDiscover}
+              className="group mt-8 inline-flex items-center gap-2 rounded-2xl bg-gradient-to-r from-violet-500 via-fuchsia-500 to-cyan-400 px-6 py-3.5 font-display text-xs font-bold uppercase tracking-[0.25em] text-white transition hover:shadow-[0_0_40px_rgba(217,70,239,0.4)]"
+            >
+              <Sparkles className="h-4 w-4" />
+              Find a song
+            </button>
           </div>
-          <h2 className="font-display text-2xl font-bold text-white sm:text-3xl">
-            The deck is waiting
-          </h2>
-          <p className="mx-auto mt-3 max-w-xs font-serif text-lg italic text-zinc-400">
-            be the one who drops the first track
-          </p>
-          <button
-            onClick={onGoDiscover}
-            className="group mt-8 inline-flex items-center gap-2 rounded-2xl bg-gradient-to-r from-violet-500 via-fuchsia-500 to-cyan-400 px-6 py-3.5 font-display text-xs font-bold uppercase tracking-[0.25em] text-white transition hover:shadow-[0_0_40px_rgba(217,70,239,0.4)]"
-          >
-            <Sparkles className="h-4 w-4" />
-            Find a song
-          </button>
         </div>
-      </div>
+      </>
     );
   }
 
   /* =================== POSTER =================== */
   return (
     <div className="animate-fade-up">
+      {preloadHost}
+
       {/* poster */}
       <div
         className="relative mx-auto w-full max-w-[560px]"
@@ -382,7 +632,7 @@ export default function NowPlaying({
         >
           <div className="relative aspect-square w-full overflow-hidden rounded-[2.25rem] bg-black shadow-[0_50px_140px_rgba(0,0,0,0.8)]">
             {/* the actual player — the living poster */}
-            <div ref={hostRef} className="absolute inset-0 [&>div]:h-full [&>div]:w-full">
+            <div className="absolute inset-0 [&>div]:h-full [&>div]:w-full">
               <div ref={mountRef} className="h-full w-full" />
             </div>
 

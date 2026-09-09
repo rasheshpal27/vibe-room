@@ -78,7 +78,7 @@ export default function PartyShell({
 
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, 1200);
+    const t = setInterval(refresh, 1000);
     return () => clearInterval(t);
   }, [refresh]);
 
