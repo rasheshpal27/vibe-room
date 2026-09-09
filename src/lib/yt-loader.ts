@@ -15,6 +15,7 @@ export interface YTPlayer {
   unMute(): void;
   isMuted(): boolean;
   setVolume(v: number): void;
+  getIframe(): HTMLIFrameElement;
   destroy(): void;
 }
 
@@ -82,8 +83,8 @@ export function createPlayer(
   el: HTMLElement,
   handlers: {
     onReady: (p: YTPlayer) => void;
-    onStateChange: (state: number) => void;
-    onError?: (code: number) => void;
+    onStateChange: (state: number, player?: YTPlayer) => void;
+    onError?: (code: number, player?: YTPlayer) => void;
   }
 ): Promise<YTPlayer> {
   return loadYouTubeAPI().then(
@@ -117,8 +118,8 @@ export function createPlayer(
               handlers.onReady(player);
               resolve(player);
             },
-            onStateChange: (e: { data: number }) => handlers.onStateChange(e.data),
-            onError: (e: { data: number }) => handlers.onError?.(e.data),
+            onStateChange: (e: { data: number }) => handlers.onStateChange(e.data, player),
+            onError: (e: { data: number }) => handlers.onError?.(e.data, player),
           },
         });
       })

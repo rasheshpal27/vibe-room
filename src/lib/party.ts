@@ -46,59 +46,77 @@ export function elapsedSec(state: {
 
 /** Mark current as done and promote the next queued item. */
 export async function advanceQueue(): Promise<void> {
-  const state = await ensureState();
-  if (state.currentQueueId) {
-    await db
-      .update(queueItems)
-      .set({ status: "done" })
-      .where(eq(queueItems.id, state.currentQueueId));
-  }
-  const next = await db
-    .select()
-    .from(queueItems)
-    .where(eq(queueItems.status, "queued"))
-    .orderBy(asc(queueItems.id))
-    .limit(1);
+  await ensureState();
+  // Run the promotion inside a transaction with a row lock so two devices
+  // reporting "ended" at the same time can't advance the queue twice.
+  await db.transaction(async (tx) => {
+    const locked = await tx
+      .select({ currentQueueId: partyState.currentQueueId })
+      .from(partyState)
+      .where(eq(partyState.id, STATE_ID))
+      .for("update");
 
-  if (next.length) {
-    const n = next[0];
-    await db
-      .update(queueItems)
-      .set({ status: "playing" })
-      .where(eq(queueItems.id, n.id));
-    await db
-      .update(partyState)
-      .set({
-        currentQueueId: n.id,
-        videoId: n.videoId,
-        title: n.title,
-        artist: n.artist,
-        thumbnail: n.thumbnail,
-        durationSec: n.durationSec,
-        isPlaying: true,
-        positionSec: 0,
-        startedByName: n.addedByName,
-        playCount: (state.playCount ?? 0) + 1,
-        updatedAt: new Date(),
-      })
-      .where(eq(partyState.id, STATE_ID));
-  } else {
-    await db
-      .update(partyState)
-      .set({
-        currentQueueId: null,
-        videoId: null,
-        title: null,
-        artist: null,
-        thumbnail: null,
-        durationSec: 0,
-        isPlaying: false,
-        positionSec: 0,
-        startedByName: "",
-        updatedAt: new Date(),
-      })
-      .where(eq(partyState.id, STATE_ID));
-  }
+    const currentQueueId = locked[0]?.currentQueueId ?? null;
+
+    if (currentQueueId) {
+      await tx
+        .update(queueItems)
+        .set({ status: "done" })
+        .where(eq(queueItems.id, currentQueueId));
+    }
+
+    const next = await tx
+      .select()
+      .from(queueItems)
+      .where(eq(queueItems.status, "queued"))
+      .orderBy(asc(queueItems.id))
+      .limit(1);
+
+    if (next.length) {
+      const n = next[0];
+      const cur = await tx
+        .select({ playCount: partyState.playCount })
+        .from(partyState)
+        .where(eq(partyState.id, STATE_ID))
+        .limit(1);
+      await tx
+        .update(queueItems)
+        .set({ status: "playing" })
+        .where(eq(queueItems.id, n.id));
+      await tx
+        .update(partyState)
+        .set({
+          currentQueueId: n.id,
+          videoId: n.videoId,
+          title: n.title,
+          artist: n.artist,
+          thumbnail: n.thumbnail,
+          durationSec: n.durationSec,
+          isPlaying: true,
+          positionSec: 0,
+          startedByName: n.addedByName,
+          playCount: (cur[0]?.playCount ?? 0) + 1,
+          updatedAt: new Date(),
+        })
+        .where(eq(partyState.id, STATE_ID));
+    } else {
+      await tx
+        .update(partyState)
+        .set({
+          currentQueueId: null,
+          videoId: null,
+          title: null,
+          artist: null,
+          thumbnail: null,
+          durationSec: 0,
+          isPlaying: false,
+          positionSec: 0,
+          startedByName: "",
+          updatedAt: new Date(),
+        })
+        .where(eq(partyState.id, STATE_ID));
+    }
+  });
 }
 
 /** If nothing is playing but songs are queued, kick things off. */
