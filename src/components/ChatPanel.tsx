@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { SendHorizontal, Smile, ImagePlay, Crown, X, Radio } from "lucide-react";
 import { CURATED_GIFS } from "@/lib/constants";
 import type { ChatMessageDTO } from "@/lib/types";
@@ -21,7 +21,7 @@ const EMOJI_GROUPS: { label: string; emojis: string[] }[] = [
   },
 ];
 
-export default function ChatPanel({ me, chat }: { me: JoinedUser; chat: ChatMessageDTO[] }) {
+function ChatPanel({ me, chat }: { me: JoinedUser; chat: ChatMessageDTO[] }) {
   const [text, setText] = useState("");
   const [picker, setPicker] = useState<"none" | "emoji" | "gif">("none");
   const [sending, setSending] = useState(false);
@@ -234,3 +234,5 @@ export default function ChatPanel({ me, chat }: { me: JoinedUser; chat: ChatMess
     </div>
   );
 }
+
+export default memo(ChatPanel);

@@ -29,8 +29,30 @@ import type { PartySnapshot } from "@/lib/types";
 import type { JoinedUser } from "./EntryGate";
 
 const LS_ADMIN = "vibe_admin_key";
-type Tab = "lyrics" | "queue" | "search" | "chat";
+/** Room poll interval. Paused entirely while the tab is hidden. */
+const POLL_MS = 1000;
+/** A poll that takes longer than this is a dead connection, not a slow one. */
+const POLL_TIMEOUT_MS = 8000;
+type Tab = "deck" | "lyrics" | "queue" | "search" | "chat";
 type RightTab = "queue" | "search" | "chat";
+
+/**
+ * Signature of everything the UI actually renders. `serverNow` and the
+ * heartbeat timestamps change on every single poll, so comparing the raw
+ * body would never match; ignoring them lets an unchanged room skip the
+ * re-render completely (most polls, most of the time).
+ */
+function renderSignature(d: PartySnapshot): string {
+  return JSON.stringify({
+    p: d.party,
+    n: d.nowPlaying,
+    q: d.queue,
+    h: d.history.map((x) => x.id),
+    u: d.users.map((x) => `${x.id}:${x.name}:${x.isAdmin}:${x.color}`),
+    c: d.chat.map((x) => x.id),
+    y: d.you ? `${d.you.id}:${d.you.isAdmin}:${d.you.color}` : null,
+  });
+}
 
 export default function PartyShell({
   me,
@@ -42,21 +64,30 @@ export default function PartyShell({
   onMe: (u: JoinedUser) => void;
 }) {
   const [snap, setSnap] = useState<PartySnapshot | null>(null);
-  const [tab, setTab] = useState<Tab>("lyrics");
+  const [tab, setTab] = useState<Tab>("deck");
   const [rightTab, setRightTab] = useState<RightTab>("queue");
-  const [playheadSec, setPlayheadSec] = useState(0);
   const [adminKey, setAdminKey] = useState("");
   const [hostModal, setHostModal] = useState(false);
   const [unreadChat, setUnreadChat] = useState(0);
   const lastChatIdRef = useRef(0);
-  const tabRef = useRef<Tab>("lyrics");
+  const seenFirstSnapRef = useRef(false);
+  const signatureRef = useRef("");
+  const inFlightRef = useRef(false);
+  const tabRef = useRef<Tab>("deck");
   const rightTabRef = useRef<RightTab>("queue");
   tabRef.current = tab;
   rightTabRef.current = rightTab;
 
   const refresh = useCallback(async () => {
+    // One request at a time: on a slow link, overlapping 1s polls pile up
+    // and every one of them costs the server a snapshot query.
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     try {
-      const res = await fetch(`/api/state?u=${me.id}`, { cache: "no-store" });
+      const res = await fetch(`/api/state?u=${me.id}`, {
+        cache: "no-store",
+        signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
+      });
       if (!res.ok) return;
       const data = (await res.json()) as PartySnapshot;
       if (!data.you) {
@@ -66,26 +97,51 @@ export default function PartyShell({
       if (data.you.isAdmin !== me.isAdmin) {
         onMe({ ...me, isAdmin: data.you.isAdmin, color: data.you.color });
       }
-      setSnap(() => {
-        const last = data.chat[data.chat.length - 1];
-        if (last && last.id !== lastChatIdRef.current) {
-          if (tabRef.current !== "chat" && rightTabRef.current !== "chat") {
-            const prevMax = lastChatIdRef.current;
-            setUnreadChat(data.chat.filter((c) => c.id > prevMax).length);
-          }
-          lastChatIdRef.current = last.id;
+
+      const last = data.chat[data.chat.length - 1];
+      if (last && last.id !== lastChatIdRef.current) {
+        const prevMax = lastChatIdRef.current;
+        lastChatIdRef.current = last.id;
+        const onChat = tabRef.current === "chat" || rightTabRef.current === "chat";
+        if (seenFirstSnapRef.current && !onChat) {
+          const fresh = data.chat.filter((c) => c.id > prevMax).length;
+          setUnreadChat((n) => n + fresh);
         }
-        return data;
-      });
+      }
+
+      // Skip the re-render when nothing visible actually changed.
+      const sig = renderSignature(data);
+      if (sig !== signatureRef.current || !seenFirstSnapRef.current) {
+        signatureRef.current = sig;
+        setSnap(data);
+      }
+      seenFirstSnapRef.current = true;
     } catch {
       /* keep polling */
+    } finally {
+      inFlightRef.current = false;
     }
   }, [me, onLeft, onMe]);
 
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, 1000);
-    return () => clearInterval(t);
+    // A backgrounded tab must not keep hammering the room: the player is
+    // throttled by the browser anyway and re-syncs the moment we return.
+    const t = setInterval(() => {
+      if (!document.hidden) refresh();
+    }, POLL_MS);
+    const wake = () => {
+      if (!document.hidden) refresh();
+    };
+    document.addEventListener("visibilitychange", wake);
+    window.addEventListener("focus", wake);
+    window.addEventListener("online", wake);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", wake);
+      window.removeEventListener("focus", wake);
+      window.removeEventListener("online", wake);
+    };
   }, [refresh]);
 
   useEffect(() => {
@@ -228,17 +284,23 @@ export default function PartyShell({
         </div>
       </header>
 
-      {/* ---------- Side-by-side body: Lyrics | Deck | Queue ----------
-           Desktop/tablet: three real columns.
-           Phone: the deck stays pinned on top (its iframe must never be
-           hidden or shrunk, or mobile browsers throttle playback) and the
-           bottom bar swaps the panel underneath it. Nothing ever scrolls
-           the page itself — only the inner panels move. */}
-      <div className="relative z-10 mx-auto flex min-h-0 w-full max-w-[1720px] flex-1 flex-col gap-2.5 overflow-hidden px-3 pb-2 pt-2.5 sm:px-5 sm:pt-3.5 md:grid md:grid-cols-[minmax(0,0.92fr)_minmax(0,1.3fr)_minmax(0,1fr)] md:gap-4 md:pb-3 lg:grid-cols-[minmax(250px,340px)_minmax(360px,1fr)_minmax(300px,400px)] xl:grid-cols-[350px_minmax(420px,1fr)_420px]">
-        {/* DECK — always mounted *and* always visible */}
+      {/* ---------- Body ----------
+           PC / laptop (md and up): three real columns — Lyrics | Deck |
+           Queue — nothing scrolls except the inside of a panel.
+           Phone: one full-screen panel at a time, chosen from the bottom
+           bar. The deck is never unmounted or shrunk (mobile browsers
+           throttle hidden/tiny iframes and the room would fall out of
+           sync); when another tab is up it simply becomes transparent and
+           untouchable behind it. */}
+      <div className="relative z-10 mx-auto flex min-h-0 w-full max-w-[1720px] flex-1 flex-col overflow-hidden px-2.5 pb-2 pt-2.5 sm:px-5 sm:pt-3.5 md:grid md:grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)_minmax(0,0.95fr)] md:gap-4 md:pb-3 lg:grid-cols-[minmax(320px,1fr)_minmax(420px,1.15fr)_minmax(300px,400px)] xl:grid-cols-[minmax(380px,1fr)_minmax(460px,1.05fr)_420px] xl:gap-5">
+        {/* DECK */}
         <section
           aria-label="Deck"
-          className="nice-scroll flex max-h-[62dvh] min-h-0 shrink-0 flex-col items-center justify-center overflow-y-auto md:order-2 md:max-h-none"
+          className={`min-h-0 flex-col items-center justify-center overflow-y-auto nice-scroll ${
+            tab === "deck"
+              ? "flex flex-1"
+              : "pointer-events-none absolute inset-0 -z-10 flex opacity-0"
+          } md:pointer-events-auto md:static md:z-auto md:order-2 md:flex md:flex-1 md:opacity-100`}
         >
           <div className="w-full">
             <NowPlaying
@@ -246,7 +308,6 @@ export default function PartyShell({
               isAdmin={isAdmin}
               onPlayerAction={playerAction}
               onGoDiscover={goDiscover}
-              onPositionChange={setPlayheadSec}
             />
             {isAdmin && (
               <AdminDock onAdmin={adminAction} onPlayer={playerAction} />
@@ -254,7 +315,7 @@ export default function PartyShell({
           </div>
         </section>
 
-        {/* LYRICS — left column on wide screens, first panel on phones */}
+        {/* LYRICS — left column on wide screens */}
         <section
           aria-label="Lyrics"
           className={`${
@@ -266,7 +327,6 @@ export default function PartyShell({
             title={snap?.nowPlaying?.title}
             artist={snap?.nowPlaying?.artist}
             durationSec={snap?.nowPlaying?.durationSec}
-            position={playheadSec}
           />
         </section>
 
@@ -274,7 +334,9 @@ export default function PartyShell({
         <aside
           aria-label="Queue and room"
           className={`${
-            tab === "lyrics" ? "hidden" : "flex"
+            tab === "queue" || tab === "search" || tab === "chat"
+              ? "flex"
+              : "hidden"
           } min-h-0 flex-1 flex-col overflow-hidden md:order-3 md:flex`}
         >
           <div className="glass-deep flex h-full min-h-0 flex-col overflow-hidden rounded-[1.4rem] sm:rounded-[1.8rem]">
@@ -328,15 +390,21 @@ export default function PartyShell({
         </aside>
       </div>
 
-      {/* ---------- phone panel switcher (the deck stays visible above) ---------- */}
+      {/* ---------- phone panel switcher ---------- */}
       <nav className="z-40 shrink-0 border-t border-white/10 bg-[#08080f]/95 backdrop-blur-xl md:hidden">
-        <div className="mx-auto grid max-w-md grid-cols-4 gap-1 px-2 pt-1.5 pb-[max(0.4rem,env(safe-area-inset-bottom))]">
+        <div className="mx-auto grid max-w-lg grid-cols-5 gap-1 px-2 pt-1.5 pb-[max(0.4rem,env(safe-area-inset-bottom))]">
+          <NavBtn
+            active={tab === "deck"}
+            onClick={() => setTab("deck")}
+            icon={<Disc3 className="h-4.5 w-4.5" />}
+            label="Deck"
+            playing={!!playing}
+          />
           <NavBtn
             active={tab === "lyrics"}
             onClick={() => setTab("lyrics")}
             icon={<MicVocal className="h-4.5 w-4.5" />}
             label="Lyrics"
-            playing={!!playing}
           />
           <NavBtn
             active={tab === "queue"}
@@ -355,7 +423,7 @@ export default function PartyShell({
               setRightTab("search");
             }}
             icon={<Search className="h-4.5 w-4.5" />}
-            label="Discover"
+            label="Find"
           />
           <NavBtn
             active={tab === "chat"}

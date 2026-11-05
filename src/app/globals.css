@@ -144,14 +144,9 @@ button, a, [role="button"] {
   opacity: 0.05;
   z-index: 1;
   background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 250 250' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.7' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  animation: grainShift 0.9s steps(4) infinite;
-}
-@keyframes grainShift {
-  0% { transform: translate(0, 0); }
-  25% { transform: translate(-2%, 3%); }
-  50% { transform: translate(3%, -2%); }
-  75% { transform: translate(-3%, -3%); }
-  100% { transform: translate(2%, 2%); }
+  /* Deliberately NOT animated: a full-screen layer that repaints every
+     225ms competes with the video decoder and makes the whole UI feel
+     laggy on laptops. The texture reads the same when it is still. */
 }
 
 /* scrolling text for long titles */
@@ -189,3 +184,16 @@ input[type="range"].vibe-range::-moz-range-thumb {
 }
 
 input[type="password"]::-ms-reveal { display: none; }
+
+/* Honour the OS "reduce motion" setting: ambient eye-candy only, never the
+   UI itself. Also a cheap escape hatch for low-powered laptops. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-aurora,
+  .animate-spin-slow,
+  .animate-pulse-ring,
+  .marquee-hover:hover .marquee-inner {
+    animation: none !important;
+  }
+  .grain::after { display: none; }
+  * { scroll-behavior: auto !important; }
+}

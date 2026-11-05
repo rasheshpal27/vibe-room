@@ -44,12 +44,21 @@ import {
   markAudioUnlocked,
   onAudioUnlock,
 } from "@/lib/audio-unlock";
+import { setPlayhead } from "@/lib/playhead";
 import { formatDuration, type PartySnapshot } from "@/lib/types";
 
-// Tight millisecond-level drift threshold (250ms) against the shared world clock.
-const SEEK_TOLERANCE_SEC = 0.25;
+// Drift threshold against the shared world clock. Correcting below ~300ms is
+// inaudible but each seek costs a decoder flush, so an over-eager threshold
+// makes playback stutter *and* drift more. Two consecutive readings must
+// breach it before we act (hysteresis against measurement noise).
+const SEEK_TOLERANCE_SEC = 0.3;
+const SEEK_STRIKES_BEFORE_SEEK = 2;
 // Minimum time between two corrective seeks (avoids decoder stutter loops).
-const SEEK_COOLDOWN_MS = 1200;
+const SEEK_COOLDOWN_MS = 2000;
+// Minimum time between two play() nudges when the player drifts out of state.
+const PLAY_NUDGE_COOLDOWN_MS = 900;
+// How long audible autoplay may fail before we fall back to muted playback.
+const AUTOPLAY_BLOCK_MS = 1100;
 // Small lead compensation (40ms) when issuing an active seek so decoder buffer
 // resume lands right on the world-clock playhead.
 const SEEK_LEAD_SEC = 0.04;
@@ -59,7 +68,6 @@ export default function NowPlaying({
   isAdmin,
   onPlayerAction,
   onGoDiscover,
-  onPositionChange,
 }: {
   snap: PartySnapshot | null;
   isAdmin: boolean;
@@ -68,7 +76,6 @@ export default function NowPlaying({
     extra?: Record<string, unknown>
   ) => Promise<void>;
   onGoDiscover: () => void;
-  onPositionChange?: (posSec: number) => void;
 }) {
   const lifecycleRef = useRef(new AbortController());
   const mountRef = useRef<HTMLDivElement | null>(null);
@@ -93,6 +100,8 @@ export default function NowPlaying({
   const forceMutedRef = useRef(false);
   // At most one automatic unmute attempt per track after a muted fallback.
   const autoUnmuteTriedRef = useRef(false);
+  /** True once this page has actually produced audible playback. */
+  const audiblePlaybackRef = useRef(false);
 
   /* ---------- audio ---------- */
   const mutedRef = useRef(false);
@@ -139,8 +148,10 @@ export default function NowPlaying({
   const creatingRef = useRef(false);
   const pendingSeekRef = useRef(false);
   const lastSeekAtRef = useRef(0);
+  const driftStrikesRef = useRef(0);
+  const lastNudgeAtRef = useRef(0);
+  const reportedDurationRef = useRef<string | null>(null);
   const onPlayerActionRef = useRef(onPlayerAction);
-  const onPositionChangeRef = useRef(onPositionChange);
 
   useEffect(() => {
     volumeRef.current = volume;
@@ -150,10 +161,6 @@ export default function NowPlaying({
   useEffect(() => {
     onPlayerActionRef.current = onPlayerAction;
   }, [onPlayerAction]);
-
-  useEffect(() => {
-    onPositionChangeRef.current = onPositionChange;
-  }, [onPositionChange]);
 
   /* ---------- mirrored state (readable from timers without re-renders) ---------- */
   const playerProblemRef = useRef("");
@@ -191,15 +198,21 @@ export default function NowPlaying({
   const ensureAudioActive = useCallback((p: YTPlayer | null) => {
     if (!p) return;
     const wantsSound = !mutedRef.current && volumeRef.current > 0;
-    const allowed = soundAllowedRef.current && !forceMutedRef.current;
     try {
-      if (!wantsSound || !allowed) {
-        // Staying muted keeps playback alive and perfectly in sync; the first
-        // tap/keypress anywhere in the app turns the sound on automatically.
+      if (!wantsSound) {
         if (!p.isMuted()) p.mute();
-        setSoundBlocked(wantsSound);
+        setSoundBlocked(false);
         return;
       }
+      if (forceMutedRef.current) {
+        // The browser refused audible autoplay for this page load: stay muted
+        // and perfectly in sync until any gesture turns the sound on.
+        if (!p.isMuted()) p.mute();
+        setSoundBlocked(true);
+        return;
+      }
+      // Always *try* with sound — most reloads are allowed to play audibly
+      // and should never show a prompt.
       if (p.isMuted()) p.unMute();
       p.setVolume(volumeRef.current || 80);
       setSoundBlocked(p.isMuted());
@@ -383,6 +396,12 @@ export default function NowPlaying({
           case "rebuild-muted":
             // Blocked autoplay is the usual culprit: come back muted (always
             // allowed) so the room stays in sync, then unmute on first tap.
+            // If this page has already played audio, autoplay is clearly not
+            // the problem — rebuild with sound instead of silencing the room.
+            if (audiblePlaybackRef.current) {
+              rebuildPlayerRef.current(false);
+              break;
+            }
             forceMutedRef.current = true;
             setSoundBlocked(!mutedRef.current);
             rebuildPlayerRef.current(true);
@@ -442,6 +461,13 @@ export default function NowPlaying({
 
         if (onTrack && (state === YT_STATE.PLAYING || state === YT_STATE.BUFFERING)) {
           loadConfirmedRef.current = true;
+          if (state === YT_STATE.PLAYING && !forceMutedRef.current) {
+            try {
+              if (!playerRef.current?.isMuted()) audiblePlaybackRef.current = true;
+            } catch {
+              /* bridge busy */
+            }
+          }
           // Recovered via the muted fallback but audio is actually allowed?
           // Give sound one automatic second chance before asking for a tap.
           if (
@@ -514,7 +540,6 @@ export default function NowPlaying({
       const muteOnStart =
         startMuted ??
         (forceMutedRef.current ||
-          !soundAllowedRef.current ||
           mutedRef.current ||
           volumeRef.current === 0);
       createPlayer(
@@ -606,6 +631,7 @@ export default function NowPlaying({
       lastHealthyAtRef.current = Date.now();
       loadConfirmedRef.current = false;
       autoUnmuteTriedRef.current = false;
+      driftStrikesRef.current = 0;
       pendingSeekRef.current = true;
       setLoadedKey(null);
 
@@ -676,11 +702,48 @@ export default function NowPlaying({
 
           const st = player.getPlayerState();
           const actualVideoId = currentPlayerVideoId(player);
+          const msSinceLoad = Date.now() - loadStartedAtRef.current;
 
           ensureAudioActive(player);
 
+          /* ---- audible autoplay refused? keep the room in sync, muted ----
+             This is the only reason a guest should ever see a sound prompt,
+             and it is checked before the recovery ladder so a blocked
+             autoplay never triggers an iframe rebuild. */
+          if (
+            party.isPlaying &&
+            !loadConfirmedRef.current &&
+            // Only the very first load of a page can hit the autoplay policy;
+            // after that a slow-loading track must not silence the room.
+            !audiblePlaybackRef.current &&
+            !forceMutedRef.current &&
+            !mutedRef.current &&
+            volumeRef.current > 0 &&
+            msSinceLoad > AUTOPLAY_BLOCK_MS &&
+            st !== YT_STATE.PLAYING &&
+            st !== YT_STATE.BUFFERING
+          ) {
+            forceMutedRef.current = true;
+            setSoundBlocked(true);
+            try {
+              player.mute();
+              player.playVideo();
+            } catch {
+              /* the ladder below will pick it up */
+            }
+            // Give the muted attempt its own fresh grace window.
+            loadStartedAtRef.current = Date.now();
+            lastHealthyAtRef.current = Date.now();
+            return;
+          }
+
           if (party.isPlaying) {
-            if (st !== YT_STATE.PLAYING && st !== YT_STATE.BUFFERING) {
+            if (
+              st !== YT_STATE.PLAYING &&
+              st !== YT_STATE.BUFFERING &&
+              Date.now() - lastNudgeAtRef.current > PLAY_NUDGE_COOLDOWN_MS
+            ) {
+              lastNudgeAtRef.current = Date.now();
               try {
                 player.playVideo();
               } catch {
@@ -694,7 +757,6 @@ export default function NowPlaying({
           }
 
           /* ---- automatic healing: did the load actually take? ---- */
-          const msSinceLoad = Date.now() - loadStartedAtRef.current;
           const wrongVideo = !!actualVideoId && actualVideoId !== np.videoId;
           const loadNeverStarted =
             (!loadConfirmedRef.current || wrongVideo) &&
@@ -738,14 +800,47 @@ export default function NowPlaying({
                 prev.driftMs === driftMs ? prev : { ...prev, driftMs }
               );
 
+              if (Math.abs(driftSec) > SEEK_TOLERANCE_SEC) {
+                driftStrikesRef.current += 1;
+              } else {
+                driftStrikesRef.current = 0;
+              }
+
+              const cooledDown =
+                Date.now() - lastSeekAtRef.current > SEEK_COOLDOWN_MS;
               if (
                 forceSeek ||
-                (Math.abs(driftSec) > SEEK_TOLERANCE_SEC &&
-                  Date.now() - lastSeekAtRef.current > SEEK_COOLDOWN_MS)
+                (driftStrikesRef.current >= SEEK_STRIKES_BEFORE_SEEK && cooledDown)
               ) {
                 const targetSec = expected + (party.isPlaying ? SEEK_LEAD_SEC : 0);
                 player.seekTo(targetSec, true);
                 lastSeekAtRef.current = Date.now();
+                driftStrikesRef.current = 0;
+              }
+            }
+
+            /* ---- fix a wrong duration coming from the search provider ----
+               A too-short duration freezes the progress bar and makes the
+               server cut the song off early; a too-long one leaves a dead
+               gap. Report the real one once, a few seconds in. */
+            if (
+              st === YT_STATE.PLAYING &&
+              reportedDurationRef.current !== trackKey &&
+              msSinceLoad > 5000
+            ) {
+              const realDuration = player.getDuration();
+              if (
+                Number.isFinite(realDuration) &&
+                realDuration > 20 &&
+                Math.abs(realDuration - (party.durationSec || 0)) > 2
+              ) {
+                reportedDurationRef.current = trackKey;
+                onPlayerActionRef
+                  .current("duration", {
+                    queueId: np.queueId,
+                    durationSec: Math.round(realDuration),
+                  })
+                  .catch(() => undefined);
               }
             }
           }
@@ -856,21 +951,31 @@ export default function NowPlaying({
     }
   }, [snap]);
 
-  /* ---------- high-resolution 100ms local progress anchored to world clock ---------- */
+  /* ---------- local progress anchored to the world clock ----------
+     The exact position is broadcast through a tiny store (100ms, no React
+     re-render) so the lyrics can follow it precisely, while this component's
+     own progress bar re-renders at a calm 250ms. */
   useEffect(() => {
-    const t = setInterval(() => {
+    const publish = () => {
       const s = snapRef.current;
       if (!s || !s.nowPlaying) {
-        setDisplayPos(0);
-        onPositionChangeRef.current?.(0);
-        return;
+        setPlayhead(0);
+        return 0;
       }
-      if (scrubbingRef.current) return;
+      if (scrubbingRef.current) return null;
       const { positionSec } = computeExpectedPosition(s.party, worldNowMs());
-      setDisplayPos(positionSec);
-      onPositionChangeRef.current?.(positionSec);
-    }, 100);
-    return () => clearInterval(t);
+      setPlayhead(positionSec);
+      return positionSec;
+    };
+    const fast = setInterval(publish, 100);
+    const slow = setInterval(() => {
+      const value = publish();
+      if (value !== null) setDisplayPos(value);
+    }, 250);
+    return () => {
+      clearInterval(fast);
+      clearInterval(slow);
+    };
   }, [worldNowMs]);
 
   /* ---------- user controls ---------- */
@@ -1008,7 +1113,7 @@ export default function NowPlaying({
   const seekLocal = (sec: number) => {
     scrubbingRef.current = true;
     setDisplayPos(sec);
-    onPositionChangeRef.current?.(sec);
+    setPlayhead(sec);
     try {
       playerRef.current?.seekTo(sec, true);
     } catch {
@@ -1146,20 +1251,22 @@ export default function NowPlaying({
                       </span>
                     )}
 
-                    <button
-                      type="button"
-                      onClick={resyncExactMs}
-                      title="Click to force exact millisecond world-clock resync"
-                      className="flex items-center gap-1 rounded-full border border-cyan-400/30 bg-black/60 px-2.5 py-1 text-[9px] font-semibold uppercase tracking-[0.15em] text-cyan-200 backdrop-blur-md transition hover:border-cyan-300/60 hover:bg-black/80"
-                    >
-                      <Clock className="h-2.5 w-2.5 text-cyan-300" />
-                      <span>
-                        UTC{" "}
-                        {clockBadge.synced
-                          ? `±${Math.abs(clockBadge.driftMs)}ms`
-                          : "syncing"}
-                      </span>
-                    </button>
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        onClick={resyncExactMs}
+                        title="Click to force exact millisecond world-clock resync"
+                        className="flex items-center gap-1 rounded-full border border-cyan-400/30 bg-black/60 px-2.5 py-1 text-[9px] font-semibold uppercase tracking-[0.15em] text-cyan-200 backdrop-blur-md transition hover:border-cyan-300/60 hover:bg-black/80"
+                      >
+                        <Clock className="h-2.5 w-2.5 text-cyan-300" />
+                        <span>
+                          UTC{" "}
+                          {clockBadge.synced
+                            ? `±${Math.abs(clockBadge.driftMs)}ms`
+                            : "syncing"}
+                        </span>
+                      </button>
+                    )}
                   </div>
 
                   {/* equalizer */}
@@ -1282,48 +1389,53 @@ export default function NowPlaying({
         </div>
       </div>
 
-      {/* Timeline & Controls when a track is active */}
+      {/* Progress — read-only for guests, scrubbable for the host */}
       {np && (
-        <>
-          <div className={`mt-2.5 sm:mt-3.5 ${posterWidth}`}>
-            <div className="flex items-center justify-between text-[11px] font-semibold tabular-nums text-zinc-500">
-              <span>{formatDuration(displayPos)}</span>
+        <div className={`mt-2.5 sm:mt-3.5 ${posterWidth}`}>
+          <div className="flex items-center justify-between text-[11px] font-semibold tabular-nums text-zinc-500">
+            <span>{formatDuration(displayPos)}</span>
+            {isAdmin && (
               <span className="text-[10px] text-zinc-600">
                 {Math.floor((displayPos % 1) * 1000)
                   .toString()
                   .padStart(3, "0")}
                 ms
               </span>
-              <span>{formatDuration(duration)}</span>
-            </div>
-            {isAdmin && duration > 0 ? (
-              <input
-                type="range"
-                min={0}
-                max={duration}
-                step={0.05}
-                value={Math.min(duration, displayPos)}
-                onChange={(e) => seekLocal(Number(e.target.value))}
-                onPointerUp={(e) =>
-                  commitSeek(Number((e.target as HTMLInputElement).value))
-                }
-                onBlur={(e) =>
-                  commitSeek(Number((e.target as HTMLInputElement).value))
-                }
-                className="vibe-range mt-2 block w-full"
-                style={{ ["--fill" as string]: `${progress * 100}%` }}
-                aria-label="Seek"
-              />
-            ) : (
-              <div className="relative mt-2 h-1.5 overflow-hidden rounded-full bg-white/10">
-                <div
-                  className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-violet-400 via-fuchsia-400 to-cyan-300"
-                  style={{ width: `${progress * 100}%` }}
-                />
-              </div>
             )}
+            <span>{formatDuration(duration)}</span>
           </div>
+          {isAdmin && duration > 0 ? (
+            <input
+              type="range"
+              min={0}
+              max={duration}
+              step={0.05}
+              value={Math.min(duration, displayPos)}
+              onChange={(e) => seekLocal(Number(e.target.value))}
+              onPointerUp={(e) =>
+                commitSeek(Number((e.target as HTMLInputElement).value))
+              }
+              onBlur={(e) =>
+                commitSeek(Number((e.target as HTMLInputElement).value))
+              }
+              className="vibe-range mt-2 block w-full"
+              style={{ ["--fill" as string]: `${progress * 100}%` }}
+              aria-label="Seek"
+            />
+          ) : (
+            <div className="relative mt-2 h-1.5 overflow-hidden rounded-full bg-white/10">
+              <div
+                className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-violet-400 via-fuchsia-400 to-cyan-300"
+                style={{ width: `${progress * 100}%` }}
+              />
+            </div>
+          )}
+        </div>
+      )}
 
+      {/* Deck controls are the host's job only */}
+      {np && isAdmin && (
+        <>
           <div
             className={`mt-2.5 flex flex-wrap items-center justify-center gap-2 sm:mt-3.5 sm:gap-2.5 ${posterWidth}`}
           >
@@ -1351,28 +1463,26 @@ export default function NowPlaying({
               />
             </div>
 
-            {isAdmin && (
-              <div className="glass flex items-center gap-1 rounded-2xl p-1.5">
-                <button
-                  onClick={() => adminTransport(isPlaying ? "pause" : "resume")}
-                  className="flex h-9 w-13 items-center justify-center rounded-xl bg-gradient-to-r from-violet-500 to-fuchsia-500 px-4 text-white shadow-[0_0_24px_rgba(168,85,247,0.4)] transition hover:scale-105 sm:h-10"
-                  title={isPlaying ? "Pause for everyone" : "Play for everyone"}
-                >
-                  {isPlaying ? (
-                    <Pause className="h-4.5 w-4.5" />
-                  ) : (
-                    <Play className="ml-0.5 h-4.5 w-4.5" />
-                  )}
-                </button>
-                <button
-                  onClick={() => adminTransport("skip")}
-                  className="flex h-9 w-9 items-center justify-center rounded-xl text-zinc-300 transition hover:bg-white/10 hover:text-white sm:h-10 sm:w-10"
-                  title="Skip track"
-                >
-                  <SkipForward className="h-4.5 w-4.5" />
-                </button>
-              </div>
-            )}
+            <div className="glass flex items-center gap-1 rounded-2xl p-1.5">
+              <button
+                onClick={() => adminTransport(isPlaying ? "pause" : "resume")}
+                className="flex h-9 w-14 items-center justify-center rounded-xl bg-gradient-to-r from-violet-500 to-fuchsia-500 text-white shadow-[0_0_24px_rgba(168,85,247,0.4)] transition hover:scale-105 sm:h-10"
+                title={isPlaying ? "Pause for everyone" : "Play for everyone"}
+              >
+                {isPlaying ? (
+                  <Pause className="h-4.5 w-4.5" />
+                ) : (
+                  <Play className="ml-0.5 h-4.5 w-4.5" />
+                )}
+              </button>
+              <button
+                onClick={() => adminTransport("skip")}
+                className="flex h-9 w-9 items-center justify-center rounded-xl text-zinc-300 transition hover:bg-white/10 hover:text-white sm:h-10 sm:w-10"
+                title="Skip track"
+              >
+                <SkipForward className="h-4.5 w-4.5" />
+              </button>
+            </div>
 
             {!ready && (
               <span className="text-xs text-zinc-500">warming up the deck…</span>

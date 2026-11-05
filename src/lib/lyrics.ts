@@ -1,4 +1,7 @@
-export function parseLyrics(lrc: string): { time: number; text: string }[] {
+/** One timestamped line of an LRC file. */
+export type LyricLine = { time: number; text: string };
+
+export function parseLyrics(lrc: string): LyricLine[] {
   return lrc.split(/\r?\n/).flatMap((line) => {
     const text = line.replace(/\[[^\]]*\]/g, "").trim();
     return [...line.matchAll(/\[(\d+):(\d{2}(?:\.\d+)?)\]/g)].map((match) => ({
