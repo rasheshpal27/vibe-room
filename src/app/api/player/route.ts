@@ -30,6 +30,29 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true });
   }
 
+  /**
+   * A guest's player exhausted every automatic recovery attempt because the
+   * video itself cannot be embedded (YouTube 100/101/150). That is identical
+   * for everyone in the room, so move the party on instead of stalling.
+   * Idempotent: only the first report for the *current* track does anything.
+   */
+  if (action === "unplayable") {
+    const qid = Number(body.queueId ?? 0);
+    const videoId = String(body.videoId ?? "");
+    if (
+      state.currentQueueId &&
+      qid === state.currentQueueId &&
+      (!videoId || !state.videoId || videoId === state.videoId)
+    ) {
+      await systemMessage(
+        `Skipped "${state.title ?? "that track"}" — YouTube blocks it from playing here`
+      );
+      await advanceQueue();
+      return NextResponse.json({ ok: true, skipped: true });
+    }
+    return NextResponse.json({ ok: true, skipped: false });
+  }
+
   if (!isAdminKey(String(body.adminKey ?? req.headers.get("x-admin-key") ?? ""))) {
     return NextResponse.json({ ok: false, error: "Admin only" }, { status: 401 });
   }

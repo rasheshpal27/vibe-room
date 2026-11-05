@@ -17,7 +17,12 @@ import {
   Clock,
   RefreshCw,
 } from "lucide-react";
-import { createPlayer, YT_STATE, type YTPlayer } from "@/lib/yt-loader";
+import {
+  createPlayer,
+  disableCaptions,
+  YT_STATE,
+  type YTPlayer,
+} from "@/lib/yt-loader";
 import {
   computeExpectedPosition,
   createClockSample,
@@ -26,6 +31,19 @@ import {
   type ClockSample,
   type ClockSyncState,
 } from "@/lib/clock";
+import {
+  classifyPlayerError,
+  planRecovery,
+  shouldHealStall,
+  shouldRetryLoad,
+  type PlayerErrorKind,
+} from "@/lib/playback";
+import {
+  installAudioUnlockListeners,
+  isAudioUnlocked,
+  markAudioUnlocked,
+  onAudioUnlock,
+} from "@/lib/audio-unlock";
 import { formatDuration, type PartySnapshot } from "@/lib/types";
 
 // Tight millisecond-level drift threshold (250ms) against the shared world clock.
@@ -53,21 +71,35 @@ export default function NowPlaying({
   onPositionChange?: (posSec: number) => void;
 }) {
   const lifecycleRef = useRef(new AbortController());
-  const mutedRef = useRef(false);
   const mountRef = useRef<HTMLDivElement | null>(null);
   const playerRef = useRef<YTPlayer | null>(null);
   const readyRef = useRef(false);
 
-  // Track both queueId and videoId so any song change is detected reliably.
+  /* ---------- track identity ---------- */
   const appliedTrackKeyRef = useRef<string | null>(null);
   const appliedQidRef = useRef<number | null>(null);
+  const wantedVideoIdRef = useRef<string | null>(null);
+  const loadStartedAtRef = useRef(0);
+  const loadConfirmedRef = useRef(false);
+  const endedReportedRef = useRef<Set<string>>(new Set());
+  const unplayableReportedRef = useRef<Set<string>>(new Set());
 
-  // Automatic self-healing retry state for song transitions (eliminates page refresh)
-  const retryCountRef = useRef(0);
-  const retryTimerRef = useRef<number | null>(null);
-  const transitionWatchdogRef = useRef<number | null>(null);
+  /* ---------- self-healing state ---------- */
+  const recoveryAttemptRef = useRef(0);
+  const recoveryTimerRef = useRef<number | null>(null);
+  const recoveryKindRef = useRef<PlayerErrorKind>("transient");
+  // 0 until the first sync tick stamps it (keeps render pure).
+  const lastHealthyAtRef = useRef(0);
+  const forceMutedRef = useRef(false);
+  // At most one automatic unmute attempt per track after a muted fallback.
+  const autoUnmuteTriedRef = useRef(false);
 
-  // High-precision monotonic world-clock sync state
+  /* ---------- audio ---------- */
+  const mutedRef = useRef(false);
+  const volumeRef = useRef(80);
+  const soundAllowedRef = useRef(false);
+
+  /* ---------- world clock ---------- */
   const clockSamplesRef = useRef<ClockSample[]>([]);
   const clockStateRef = useRef<ClockSyncState>({
     utcAtMonoZero:
@@ -94,9 +126,11 @@ export default function NowPlaying({
   const [displayPos, setDisplayPos] = useState(0);
   const [tilt, setTilt] = useState({ x: 0, y: 0 });
   const [playerProblem, setPlayerProblem] = useState("");
+  const [healing, setHealing] = useState(false);
+  const [soundBlocked, setSoundBlocked] = useState(false);
   // optimistic transport state (cleared as soon as the server confirms)
   const [uiPlaying, setUiPlaying] = useState<boolean | null>(null);
-  // track key currently loaded into the player — drives the "switching" overlay
+  // track key currently confirmed playing — drives the "switching" overlay
   const [loadedTrackKey, setLoadedTrackKey] = useState<string | null>(null);
 
   const busyRef = useRef(false);
@@ -105,7 +139,6 @@ export default function NowPlaying({
   const creatingRef = useRef(false);
   const pendingSeekRef = useRef(false);
   const lastSeekAtRef = useRef(0);
-  const volumeRef = useRef(80);
   const onPlayerActionRef = useRef(onPlayerAction);
   const onPositionChangeRef = useRef(onPositionChange);
 
@@ -121,6 +154,22 @@ export default function NowPlaying({
   useEffect(() => {
     onPositionChangeRef.current = onPositionChange;
   }, [onPositionChange]);
+
+  /* ---------- mirrored state (readable from timers without re-renders) ---------- */
+  const playerProblemRef = useRef("");
+  const loadedTrackKeyRef = useRef<string | null>(null);
+
+  const setProblem = useCallback((message: string) => {
+    if (playerProblemRef.current === message) return;
+    playerProblemRef.current = message;
+    setPlayerProblem(message);
+  }, []);
+
+  const setLoadedKey = useCallback((key: string | null) => {
+    if (loadedTrackKeyRef.current === key) return;
+    loadedTrackKeyRef.current = key;
+    setLoadedTrackKey(key);
+  }, []);
 
   /* ---------- world-clock "now" in exact UTC milliseconds ---------- */
   const worldNowMs = useCallback(() => {
@@ -138,29 +187,38 @@ export default function NowPlaying({
     return computeExpectedPosition(s.party, worldNowMs()).positionSec;
   }, [worldNowMs]);
 
-  /* ---------- apply automatic unmute + volume to player ---------- */
+  /* ---------- sound: ON automatically whenever the browser allows it ---------- */
   const ensureAudioActive = useCallback((p: YTPlayer | null) => {
     if (!p) return;
+    const wantsSound = !mutedRef.current && volumeRef.current > 0;
+    const allowed = soundAllowedRef.current && !forceMutedRef.current;
     try {
-      if (mutedRef.current || volumeRef.current === 0) {
-        p.mute();
-      } else {
-        p.unMute();
-        p.setVolume(volumeRef.current || 80);
+      if (!wantsSound || !allowed) {
+        // Staying muted keeps playback alive and perfectly in sync; the first
+        // tap/keypress anywhere in the app turns the sound on automatically.
+        if (!p.isMuted()) p.mute();
+        setSoundBlocked(wantsSound);
+        return;
       }
+      if (p.isMuted()) p.unMute();
+      p.setVolume(volumeRef.current || 80);
+      setSoundBlocked(p.isMuted());
     } catch {
-      /* ignore if player bridge is still initializing */
+      /* player bridge still initializing */
     }
   }, []);
 
-  /* ---------- Automatic global audio unlock (sound is ON by default) ---------- */
+  /* ---------- global gesture → sound on ---------- */
   useEffect(() => {
-    const unlockAudio = () => {
+    installAudioUnlockListeners();
+    soundAllowedRef.current = isAudioUnlocked();
+    const unlock = () => {
+      soundAllowedRef.current = true;
+      forceMutedRef.current = false;
       const p = playerRef.current;
-      if (!p || !readyRef.current || mutedRef.current) return;
+      if (!p || !readyRef.current) return;
+      ensureAudioActive(p);
       try {
-        p.unMute();
-        p.setVolume(volumeRef.current || 80);
         if (
           snapRef.current?.party.isPlaying &&
           snapRef.current?.nowPlaying &&
@@ -172,15 +230,17 @@ export default function NowPlaying({
         /* ignore */
       }
     };
-    window.addEventListener("pointerdown", unlockAudio, { passive: true });
-    window.addEventListener("keydown", unlockAudio, { passive: true });
-    window.addEventListener("touchstart", unlockAudio, { passive: true });
+    const unsubscribe = onAudioUnlock(unlock);
+    // Some browsers only report activation on the *next* gesture, so keep a
+    // lightweight poll alive for the first few seconds after mount.
+    const poll = window.setInterval(() => {
+      if (!soundAllowedRef.current && isAudioUnlocked()) unlock();
+    }, 500);
     return () => {
-      window.removeEventListener("pointerdown", unlockAudio);
-      window.removeEventListener("keydown", unlockAudio);
-      window.removeEventListener("touchstart", unlockAudio);
+      unsubscribe();
+      window.clearInterval(poll);
     };
-  }, []);
+  }, [ensureAudioActive]);
 
   /* ---------- Multi-sample NTP burst clock sync against UTC world clock ---------- */
   const runClockBurst = useCallback(async (burstCount = 4) => {
@@ -253,52 +313,158 @@ export default function NowPlaying({
     };
   }, [snap]);
 
-  // Forward declarations via refs so rebuildPlayer, mountPlayer, and sync can call each other cleanly
+  // Forward refs so sync / rebuild / recovery can call each other cleanly.
   const syncRef = useRef<(forceSeek?: boolean) => void>(() => {});
-  const rebuildPlayerRef = useRef<() => void>(() => {});
+  const rebuildPlayerRef = useRef<(startMuted?: boolean) => void>(() => {});
 
-  /* ---------- clear transition timers ---------- */
-  const clearTransitionTimers = useCallback(() => {
-    if (retryTimerRef.current !== null) {
-      window.clearTimeout(retryTimerRef.current);
-      retryTimerRef.current = null;
-    }
-    if (transitionWatchdogRef.current !== null) {
-      window.clearTimeout(transitionWatchdogRef.current);
-      transitionWatchdogRef.current = null;
+  const clearRecoveryTimer = useCallback(() => {
+    if (recoveryTimerRef.current !== null) {
+      window.clearTimeout(recoveryTimerRef.current);
+      recoveryTimerRef.current = null;
     }
   }, []);
 
+  /* ---------- mark playback healthy (clears every recovery flag) ---------- */
+  const markHealthy = useCallback(() => {
+    recoveryAttemptRef.current = 0;
+    lastHealthyAtRef.current = Date.now();
+    clearRecoveryTimer();
+    setHealing(false);
+    setProblem("");
+  }, [clearRecoveryTimer, setProblem]);
+
+  /* ---------- tell the room a video simply cannot be embedded ---------- */
+  const reportUnplayable = useCallback(() => {
+    const s = snapRef.current;
+    const np = s?.nowPlaying;
+    if (!np?.videoId) return;
+    const key = `${np.queueId ?? 0}:${np.videoId}`;
+    if (unplayableReportedRef.current.has(key)) return;
+    unplayableReportedRef.current.add(key);
+    setProblem("");
+    setHealing(true);
+    onPlayerActionRef
+      .current("unplayable", { queueId: np.queueId, videoId: np.videoId })
+      .catch(() => undefined);
+  }, [setProblem]);
+
+  /* ---------- the escalating recovery ladder ---------- */
+  const startRecovery = useCallback(
+    (kind: PlayerErrorKind) => {
+      if (recoveryTimerRef.current !== null) return; // one ladder at a time
+      recoveryKindRef.current = kind;
+      const attempt = recoveryAttemptRef.current;
+      const plan = planRecovery(kind, attempt);
+      recoveryAttemptRef.current = attempt + 1;
+      setHealing(true);
+      if (plan.surface) {
+        setProblem(
+          kind === "embed-blocked"
+            ? "This video blocks embedded playback. Reconnecting — skip it if it stays stuck."
+            : "Reconnecting to YouTube… this fixes itself, no refresh needed."
+        );
+      }
+
+      recoveryTimerRef.current = window.setTimeout(() => {
+        recoveryTimerRef.current = null;
+        const s = snapRef.current;
+        if (!s?.nowPlaying) {
+          setHealing(false);
+          return;
+        }
+        switch (plan.step) {
+          case "reload":
+            appliedTrackKeyRef.current = null;
+            syncRef.current(true);
+            break;
+          case "rebuild":
+            rebuildPlayerRef.current(false);
+            break;
+          case "rebuild-muted":
+            // Blocked autoplay is the usual culprit: come back muted (always
+            // allowed) so the room stays in sync, then unmute on first tap.
+            forceMutedRef.current = true;
+            setSoundBlocked(!mutedRef.current);
+            rebuildPlayerRef.current(true);
+            break;
+          case "report-unplayable":
+            reportUnplayable();
+            break;
+        }
+      }, plan.delayMs);
+    },
+    [reportUnplayable, setProblem]
+  );
+
   /* ---------- player event handlers ---------- */
+  const currentPlayerVideoId = useCallback((p: YTPlayer | null) => {
+    if (!p) return null;
+    try {
+      return p.getVideoData?.()?.video_id ?? null;
+    } catch {
+      return null;
+    }
+  }, []);
+
   const handleStateChange = useCallback(
     (state: number, target?: YTPlayer) => {
       if (target && target !== playerRef.current) return;
+      const s = snapRef.current;
+
       if (state === YT_STATE.ENDED) {
-        const s = snapRef.current;
-        const qid = appliedQidRef.current ?? s?.nowPlaying?.queueId ?? null;
-        if (s?.nowPlaying && qid) {
-          onPlayerActionRef
-            .current("ended", { queueId: qid })
-            .catch(() => undefined);
+        const np = s?.nowPlaying;
+        const playing = currentPlayerVideoId(playerRef.current);
+        // Ignore an ENDED that belongs to the previous track.
+        if (!np || (playing && wantedVideoIdRef.current && playing !== wantedVideoIdRef.current)) {
+          return;
         }
+        const qid = appliedQidRef.current ?? np.queueId ?? null;
+        const key = `${qid ?? 0}:${np.videoId}`;
+        if (endedReportedRef.current.has(key)) return;
+        endedReportedRef.current.add(key);
+        onPlayerActionRef
+          .current("ended", { queueId: qid })
+          .catch(() => undefined);
         return;
       }
 
-      if (state === YT_STATE.PLAYING || state === YT_STATE.PAUSED) {
-        // Track transition succeeded! Reset retry counters and clear any transient error.
-        retryCountRef.current = 0;
-        setPlayerProblem("");
-        if (transitionWatchdogRef.current !== null) {
-          window.clearTimeout(transitionWatchdogRef.current);
-          transitionWatchdogRef.current = null;
+      if (
+        state === YT_STATE.PLAYING ||
+        state === YT_STATE.BUFFERING ||
+        state === YT_STATE.PAUSED ||
+        state === YT_STATE.CUED
+      ) {
+        const playing = currentPlayerVideoId(playerRef.current);
+        const onTrack =
+          !wantedVideoIdRef.current ||
+          !playing ||
+          playing === wantedVideoIdRef.current;
+
+        if (onTrack && (state === YT_STATE.PLAYING || state === YT_STATE.BUFFERING)) {
+          loadConfirmedRef.current = true;
+          // Recovered via the muted fallback but audio is actually allowed?
+          // Give sound one automatic second chance before asking for a tap.
+          if (
+            forceMutedRef.current &&
+            soundAllowedRef.current &&
+            !autoUnmuteTriedRef.current
+          ) {
+            autoUnmuteTriedRef.current = true;
+            forceMutedRef.current = false;
+          }
+          markHealthy();
+          if (s?.nowPlaying) {
+            setLoadedKey(`${s.nowPlaying.queueId ?? 0}:${s.nowPlaying.videoId}`);
+          }
         }
-        const s = snapRef.current;
-        if (s?.nowPlaying) {
-          setLoadedTrackKey(`${s.nowPlaying.queueId ?? 0}:${s.nowPlaying.videoId}`);
+        if (onTrack && state === YT_STATE.PAUSED && !s?.party.isPlaying) {
+          markHealthy();
         }
+
+        disableCaptions(playerRef.current);
         ensureAudioActive(playerRef.current);
 
-        if (pendingSeekRef.current) {
+        if (pendingSeekRef.current && state !== YT_STATE.CUED) {
           pendingSeekRef.current = false;
           const p = playerRef.current;
           if (p && s?.nowPlaying) {
@@ -314,7 +480,13 @@ export default function NowPlaying({
         }
       }
     },
-    [expectedPos, ensureAudioActive]
+    [
+      expectedPos,
+      ensureAudioActive,
+      markHealthy,
+      currentPlayerVideoId,
+      setLoadedKey,
+    ]
   );
 
   const handleError = useCallback(
@@ -322,112 +494,158 @@ export default function NowPlaying({
       if (target && target !== playerRef.current) return;
       const np = snapRef.current?.nowPlaying;
       if (!np?.videoId) return;
-
-      // Self-healing recovery: before showing any error to the user, automatically
-      // retry loading or recreate the YouTube player instance (just like a page refresh).
-      if (retryCountRef.current < 2) {
-        retryCountRef.current += 1;
-        const attempt = retryCountRef.current;
-        if (retryTimerRef.current !== null) {
-          window.clearTimeout(retryTimerRef.current);
-        }
-        retryTimerRef.current = window.setTimeout(() => {
-          retryTimerRef.current = null;
-          if (attempt === 1 && playerRef.current && readyRef.current) {
-            // Attempt 1: re-issue loadVideoById on the existing player
-            appliedTrackKeyRef.current = null;
-            syncRef.current(true);
-          } else {
-            // Attempt 2: full in-place player rebuild (equivalent to a page refresh)
-            rebuildPlayerRef.current();
-          }
-        }, 350);
+      // Errors raised for the track we already moved past are irrelevant.
+      const playing = currentPlayerVideoId(playerRef.current);
+      if (playing && wantedVideoIdRef.current && playing !== wantedVideoIdRef.current) {
         return;
       }
-
-      const friendly =
-        code === 101 || code === 150
-          ? "This YouTube video does not allow embedded playback. Skip it or choose another version."
-          : "YouTube had trouble loading this track. Click Retry or skip to the next track.";
-      setPlayerProblem(friendly);
+      startRecovery(classifyPlayerError(code));
     },
-    []
+    [startRecovery, currentPlayerVideoId]
   );
 
   /* ---------- create or recreate the player in place ---------- */
-  const mountPlayer = useCallback(() => {
-    const el = mountRef.current;
-    if (!el || playerRef.current || creatingRef.current) return;
-    creatingRef.current = true;
-    const signal = lifecycleRef.current.signal;
-    createPlayer(
-      el,
-      {
-        onReady: (p) => {
-          playerRef.current = p;
-          readyRef.current = true;
-          setPlayerProblem("");
-          ensureAudioActive(p);
-          setReady(true);
-          syncRef.current(true);
+  const mountPlayer = useCallback(
+    (startMuted?: boolean) => {
+      const el = mountRef.current;
+      if (!el || playerRef.current || creatingRef.current) return;
+      creatingRef.current = true;
+      const signal = lifecycleRef.current.signal;
+      const muteOnStart =
+        startMuted ??
+        (forceMutedRef.current ||
+          !soundAllowedRef.current ||
+          mutedRef.current ||
+          volumeRef.current === 0);
+      createPlayer(
+        el,
+        {
+          onReady: (p) => {
+            playerRef.current = p;
+            readyRef.current = true;
+            lastHealthyAtRef.current = Date.now();
+            disableCaptions(p);
+            ensureAudioActive(p);
+            setReady(true);
+            setProblem("");
+            syncRef.current(true);
+          },
+          onStateChange: handleStateChange,
+          onError: handleError,
+          onApiChange: (p) => disableCaptions(p),
         },
-        onStateChange: handleStateChange,
-        onError: handleError,
-      },
-      signal
-    )
-      .catch((err) => {
-        if (signal.aborted) return;
-        playerRef.current = null;
-        readyRef.current = false;
-        setPlayerProblem(
-          err instanceof Error
-            ? err.message
-            : "YouTube player could not start."
-        );
-      })
-      .finally(() => {
-        if (!signal.aborted) creatingRef.current = false;
-      });
-  }, [handleStateChange, handleError, ensureAudioActive]);
+        signal,
+        { startMuted: muteOnStart }
+      )
+        .catch((err) => {
+          if (signal.aborted) return;
+          playerRef.current = null;
+          readyRef.current = false;
+          // Keep healing in the background instead of dead-ending the deck.
+          startRecovery("transient");
+          setProblem(
+            err instanceof Error
+              ? err.message
+              : "YouTube player could not start."
+          );
+        })
+        .finally(() => {
+          if (!signal.aborted) creatingRef.current = false;
+        });
+    },
+    [handleStateChange, handleError, ensureAudioActive, startRecovery, setProblem]
+  );
 
-  const rebuildPlayer = useCallback(() => {
-    clearTransitionTimers();
-    try {
-      playerRef.current?.destroy();
-    } catch {
-      /* ignore */
-    }
-    playerRef.current = null;
-    readyRef.current = false;
-    creatingRef.current = false;
-    appliedTrackKeyRef.current = null;
-    appliedQidRef.current = null;
-    setReady(false);
-    setPlayerProblem("");
-    mountPlayer();
-  }, [clearTransitionTimers, mountPlayer]);
+  const rebuildPlayer = useCallback(
+    (startMuted?: boolean) => {
+      // Cancel any creation still in flight so we never end up with two
+      // players racing for the same mount node.
+      if (creatingRef.current) {
+        try {
+          lifecycleRef.current.abort();
+        } catch {
+          /* ignore */
+        }
+        lifecycleRef.current = new AbortController();
+      }
+      try {
+        playerRef.current?.destroy();
+      } catch {
+        /* ignore */
+      }
+      playerRef.current = null;
+      readyRef.current = false;
+      creatingRef.current = false;
+      appliedTrackKeyRef.current = null;
+      appliedQidRef.current = null;
+      pendingSeekRef.current = false;
+      lastHealthyAtRef.current = Date.now();
+      setReady(false);
+      mountPlayer(startMuted);
+    },
+    [mountPlayer]
+  );
 
   useEffect(() => {
     rebuildPlayerRef.current = rebuildPlayer;
   }, [rebuildPlayer]);
+
+  /* ---------- load a track onto the live player ---------- */
+  const loadTrack = useCallback(
+    (
+      player: YTPlayer,
+      videoId: string,
+      trackKey: string,
+      queueId: number | null,
+      shouldPlay: boolean
+    ) => {
+      appliedTrackKeyRef.current = trackKey;
+      appliedQidRef.current = queueId;
+      wantedVideoIdRef.current = videoId;
+      loadStartedAtRef.current = Date.now();
+      lastHealthyAtRef.current = Date.now();
+      loadConfirmedRef.current = false;
+      autoUnmuteTriedRef.current = false;
+      pendingSeekRef.current = true;
+      setLoadedKey(null);
+
+      const expected = expectedPos();
+      const startSeconds = Math.max(0, expected + (shouldPlay ? SEEK_LEAD_SEC : 0));
+
+      try {
+        ensureAudioActive(player);
+        if (shouldPlay) {
+          player.loadVideoById({ videoId, startSeconds });
+        } else {
+          player.cueVideoById({ videoId, startSeconds: Math.max(0, expected) });
+        }
+        disableCaptions(player);
+      } catch {
+        // The bridge went stale mid-transition — rebuild instead of surfacing.
+        appliedTrackKeyRef.current = null;
+        startRecovery("transient");
+      }
+    },
+    [expectedPos, ensureAudioActive, startRecovery, setLoadedKey]
+  );
 
   /* ---------- sync the player with the shared world clock ---------- */
   const sync = useCallback(
     (forceSeek = false) => {
       const s = snapRef.current;
       if (!s) return;
+      if (!lastHealthyAtRef.current) lastHealthyAtRef.current = Date.now();
 
       const np = s.nowPlaying;
-      const p = s.party;
+      const party = s.party;
 
-      // If we have a track but the player isn't mounted or its iframe got detached, heal it
       const player = playerRef.current;
       if (np?.videoId) {
         if (!player || !readyRef.current) {
           mountPlayer();
           return;
         }
+        // The iframe can be detached by extensions / aggressive mobile GC.
         try {
           const iframe = player.getIframe?.();
           if (iframe && !iframe.isConnected) {
@@ -447,76 +665,66 @@ export default function NowPlaying({
         if (np && np.videoId) {
           const trackKey = `${np.queueId ?? 0}:${np.videoId}`;
           if (appliedTrackKeyRef.current !== trackKey) {
-            appliedTrackKeyRef.current = trackKey;
-            appliedQidRef.current = np.queueId;
-            setLoadedTrackKey(trackKey);
-            setPlayerProblem("");
-            pendingSeekRef.current = true;
-
-            ensureAudioActive(player);
-            const startSeconds = Math.max(
-              0,
-              expected + (p.isPlaying ? SEEK_LEAD_SEC : 0)
-            );
-
-            if (p.isPlaying) {
-              player.loadVideoById({
-                videoId: np.videoId,
-                startSeconds,
-              });
-            } else {
-              player.cueVideoById({
-                videoId: np.videoId,
-                startSeconds: expected,
-              });
-            }
-
-            // Watchdog: if the new song is supposed to be playing but gets stuck
-            // in UNSTARTED (-1) or CUED (5) for >3.8s during transition, self-heal automatically.
-            if (transitionWatchdogRef.current !== null) {
-              window.clearTimeout(transitionWatchdogRef.current);
-            }
-            transitionWatchdogRef.current = window.setTimeout(() => {
-              transitionWatchdogRef.current = null;
-              const curSnap = snapRef.current;
-              const curPlayer = playerRef.current;
-              if (!curSnap?.nowPlaying || !curSnap.party.isPlaying || !curPlayer) {
-                return;
-              }
-              try {
-                const st = curPlayer.getPlayerState();
-                if (st !== YT_STATE.PLAYING && st !== YT_STATE.BUFFERING) {
-                  if (retryCountRef.current < 1) {
-                    retryCountRef.current += 1;
-                    ensureAudioActive(curPlayer);
-                    curPlayer.loadVideoById({
-                      videoId: curSnap.nowPlaying.videoId,
-                      startSeconds: expectedPos() + SEEK_LEAD_SEC,
-                    });
-                    curPlayer.playVideo();
-                  } else {
-                    rebuildPlayer();
-                  }
-                }
-              } catch {
-                rebuildPlayer();
-              }
-            }, 3800);
+            // Brand new song: reset every per-track flag before loading.
+            recoveryAttemptRef.current = 0;
+            clearRecoveryTimer();
+            setHealing(false);
+            setProblem("");
+            loadTrack(player, np.videoId, trackKey, np.queueId, party.isPlaying);
             return;
           }
 
           const st = player.getPlayerState();
+          const actualVideoId = currentPlayerVideoId(player);
 
-          // Keep audio unmuted automatically unless the user explicitly clicked mute
           ensureAudioActive(player);
 
-          if (p.isPlaying) {
+          if (party.isPlaying) {
             if (st !== YT_STATE.PLAYING && st !== YT_STATE.BUFFERING) {
-              player.playVideo();
+              try {
+                player.playVideo();
+              } catch {
+                /* handled by the stall detector below */
+              }
             }
           } else {
             if (st === YT_STATE.PLAYING || st === YT_STATE.BUFFERING) {
               player.pauseVideo();
+            }
+          }
+
+          /* ---- automatic healing: did the load actually take? ---- */
+          const msSinceLoad = Date.now() - loadStartedAtRef.current;
+          const wrongVideo = !!actualVideoId && actualVideoId !== np.videoId;
+          const loadNeverStarted =
+            (!loadConfirmedRef.current || wrongVideo) &&
+            shouldRetryLoad({
+              expectedVideoId: np.videoId,
+              actualVideoId,
+              playerState: st,
+              shouldPlay: party.isPlaying,
+              msSinceLoad,
+            });
+
+          if (loadNeverStarted && recoveryTimerRef.current === null) {
+            startRecovery("transient");
+          } else if (
+            shouldHealStall({
+              shouldPlay: party.isPlaying,
+              playerState: st,
+              msSinceHealthy: Date.now() - lastHealthyAtRef.current,
+              recoveryPending: recoveryTimerRef.current !== null,
+            })
+          ) {
+            startRecovery("transient");
+          } else if (st === YT_STATE.PLAYING || st === YT_STATE.BUFFERING) {
+            if (!wrongVideo) loadConfirmedRef.current = true;
+            lastHealthyAtRef.current = Date.now();
+            if (recoveryAttemptRef.current !== 0 || playerProblemRef.current) {
+              markHealthy();
+            }
+            if (loadedTrackKeyRef.current !== trackKey) {
+              setLoadedKey(trackKey);
             }
           }
 
@@ -535,8 +743,7 @@ export default function NowPlaying({
                 (Math.abs(driftSec) > SEEK_TOLERANCE_SEC &&
                   Date.now() - lastSeekAtRef.current > SEEK_COOLDOWN_MS)
               ) {
-                const targetSec =
-                  expected + (p.isPlaying ? SEEK_LEAD_SEC : 0);
+                const targetSec = expected + (party.isPlaying ? SEEK_LEAD_SEC : 0);
                 player.seekTo(targetSec, true);
                 lastSeekAtRef.current = Date.now();
               }
@@ -545,9 +752,11 @@ export default function NowPlaying({
         } else if (appliedTrackKeyRef.current !== null) {
           appliedTrackKeyRef.current = null;
           appliedQidRef.current = null;
-          setLoadedTrackKey(null);
-          setPlayerProblem("");
-          clearTransitionTimers();
+          wantedVideoIdRef.current = null;
+          setLoadedKey(null);
+          clearRecoveryTimer();
+          setHealing(false);
+          setProblem("");
           try {
             player.stopVideo();
           } catch {
@@ -555,11 +764,8 @@ export default function NowPlaying({
           }
         }
       } catch {
-        // If calling methods on the player threw an exception, rebuild it automatically
-        if (retryCountRef.current < 2) {
-          retryCountRef.current += 1;
-          rebuildPlayer();
-        }
+        // Any exception from the bridge means the iframe is unusable → heal.
+        startRecovery("transient");
       }
     },
     [
@@ -567,7 +773,13 @@ export default function NowPlaying({
       mountPlayer,
       rebuildPlayer,
       ensureAudioActive,
-      clearTransitionTimers,
+      loadTrack,
+      startRecovery,
+      clearRecoveryTimer,
+      currentPlayerVideoId,
+      markHealthy,
+      setProblem,
+      setLoadedKey,
     ]
   );
 
@@ -575,14 +787,16 @@ export default function NowPlaying({
     syncRef.current = sync;
   }, [sync]);
 
-  // Mount the player once on component mount and keep it alive across tracks
+  // Mount the player once and keep it alive across tracks.
   useEffect(() => {
-    const controller = new AbortController();
-    lifecycleRef.current = controller;
+    lifecycleRef.current = new AbortController();
     mountPlayer();
     return () => {
-      controller.abort();
-      clearTransitionTimers();
+      lifecycleRef.current.abort();
+      if (recoveryTimerRef.current !== null) {
+        window.clearTimeout(recoveryTimerRef.current);
+        recoveryTimerRef.current = null;
+      }
       try {
         playerRef.current?.destroy();
       } catch {
@@ -593,17 +807,20 @@ export default function NowPlaying({
       creatingRef.current = false;
       appliedTrackKeyRef.current = null;
       appliedQidRef.current = null;
+      wantedVideoIdRef.current = null;
     };
-  }, [mountPlayer, clearTransitionTimers]);
+  }, [mountPlayer]);
 
-  // Whenever the active track changes, reset error/retry counters and sync immediately
+  // A new track resets per-track recovery state and syncs immediately.
   useEffect(() => {
-    retryCountRef.current = 0;
-    setPlayerProblem("");
+    recoveryAttemptRef.current = 0;
+    lastHealthyAtRef.current = Date.now();
+    setProblem("");
+    setHealing(false);
     sync(false);
   }, [snap?.nowPlaying?.queueId, snap?.nowPlaying?.videoId, sync]);
 
-  // Keep the player tightly synced with the world clock (every 500ms)
+  // Keep the player tightly synced with the world clock (every 500ms).
   useEffect(() => {
     const t = setInterval(() => sync(false), 500);
     return () => clearInterval(t);
@@ -612,6 +829,23 @@ export default function NowPlaying({
   useEffect(() => {
     sync(false);
   }, [snap, sync]);
+
+  // Returning to the tab after a mobile freeze: re-check everything at once.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      lastHealthyAtRef.current = Date.now();
+      sync(true);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    window.addEventListener("online", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+      window.removeEventListener("online", onVisible);
+    };
+  }, [sync]);
 
   // When a fresh server state arrives, stop overriding with optimistic UI.
   useEffect(() => {
@@ -639,15 +873,46 @@ export default function NowPlaying({
     return () => clearInterval(t);
   }, [worldNowMs]);
 
+  /* ---------- user controls ---------- */
+  const enableSound = useCallback(() => {
+    markAudioUnlocked();
+    soundAllowedRef.current = true;
+    forceMutedRef.current = false;
+    mutedRef.current = false;
+    setMuted(false);
+    if (volumeRef.current === 0) {
+      volumeRef.current = 80;
+      setVolume(80);
+    }
+    const p = playerRef.current;
+    if (!p) return;
+    try {
+      p.unMute();
+      p.setVolume(volumeRef.current || 80);
+      setSoundBlocked(p.isMuted());
+      if (snapRef.current?.party.isPlaying) p.playVideo();
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   const toggleMute = () => {
     const p = playerRef.current;
     if (muted) {
+      markAudioUnlocked();
+      soundAllowedRef.current = true;
+      forceMutedRef.current = false;
       mutedRef.current = false;
       setMuted(false);
+      if (volumeRef.current === 0) {
+        volumeRef.current = 80;
+        setVolume(80);
+      }
       if (p) {
         try {
           p.unMute();
           p.setVolume(volumeRef.current || 80);
+          setSoundBlocked(p.isMuted());
           if (snapRef.current?.party.isPlaying) p.playVideo();
         } catch {
           /* ignore */
@@ -656,6 +921,7 @@ export default function NowPlaying({
     } else {
       mutedRef.current = true;
       setMuted(true);
+      setSoundBlocked(false);
       if (p) {
         try {
           p.mute();
@@ -667,6 +933,9 @@ export default function NowPlaying({
   };
 
   const changeVolume = (v: number) => {
+    markAudioUnlocked();
+    soundAllowedRef.current = true;
+    forceMutedRef.current = false;
     setVolume(v);
     volumeRef.current = v;
     const p = playerRef.current;
@@ -677,10 +946,12 @@ export default function NowPlaying({
         mutedRef.current = true;
         setMuted(true);
         p.mute();
+        setSoundBlocked(false);
       } else {
         mutedRef.current = false;
         setMuted(false);
         p.unMute();
+        setSoundBlocked(p.isMuted());
         if (snapRef.current?.party.isPlaying) p.playVideo();
       }
     } catch {
@@ -712,8 +983,10 @@ export default function NowPlaying({
           }
         }
       } else if (action === "skip") {
-        setPlayerProblem("");
-        retryCountRef.current = 0;
+        setProblem("");
+        setHealing(false);
+        recoveryAttemptRef.current = 0;
+        clearRecoveryTimer();
       }
     } catch {
       /* ignore */
@@ -753,6 +1026,16 @@ export default function NowPlaying({
     sync(true);
   };
 
+  const manualRetry = () => {
+    recoveryAttemptRef.current = 0;
+    clearRecoveryTimer();
+    unplayableReportedRef.current.clear();
+    setProblem("");
+    setHealing(true);
+    enableSound();
+    rebuildPlayer(false);
+  };
+
   const np = snap?.nowPlaying ?? null;
   const duration = snap?.party.durationSec ?? 0;
   const isPlaying = uiPlaying ?? (!!snap?.party.isPlaying && !!np);
@@ -767,11 +1050,14 @@ export default function NowPlaying({
     setTilt({ x: y, y: x });
   };
 
+  const posterWidth =
+    "mx-auto w-full max-w-[min(100%,34dvh,440px)] sm:max-w-[min(100%,38dvh,440px)] md:max-w-[min(100%,40dvh,440px)] lg:max-w-[min(100%,46dvh,460px)]";
+
   return (
-    <div className="flex flex-col items-center justify-center animate-fade-up">
+    <div className="flex w-full flex-col items-center justify-center animate-fade-up">
       {/* Poster / Empty Deck */}
       <div
-        className="relative mx-auto w-full max-w-[min(100%,440px)] lg:max-w-[min(100%,46dvh)]"
+        className={`relative ${posterWidth}`}
         style={{ perspective: "1200px" }}
         onMouseMove={np ? handleTilt : undefined}
         onMouseLeave={np ? () => setTilt({ x: 0, y: 0 }) : undefined}
@@ -798,12 +1084,22 @@ export default function NowPlaying({
           <div className="relative aspect-square w-full overflow-hidden rounded-[2.05rem] bg-black shadow-[0_40px_110px_rgba(0,0,0,0.8)]">
             {/* Persistent YouTube player container — stays mounted so iframe never reloads */}
             <div
-              className={`absolute inset-0 [&>div]:h-full [&>div]:w-full ${
+              className={`absolute inset-0 z-0 [&>div]:h-full [&>div]:w-full ${
                 np ? "opacity-100" : "pointer-events-none opacity-0"
               }`}
             >
               <div ref={mountRef} className="h-full w-full" />
             </div>
+
+            {/* Tap-anywhere sound unlock. Also shields YouTube's own overlay
+                buttons so a stray tap can never pause one guest out of sync. */}
+            {np && (
+              <div
+                className="absolute inset-0 z-10"
+                onPointerDown={enableSound}
+                aria-hidden
+              />
+            )}
 
             {!np ? (
               /* Empty deck state */
@@ -834,11 +1130,11 @@ export default function NowPlaying({
             ) : (
               <>
                 {/* cinematic overlays */}
-                <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/85 via-transparent to-black/45" />
-                <div className="pointer-events-none absolute inset-0 opacity-[0.07] [background:repeating-linear-gradient(0deg,transparent_0_2px,#fff_2px_3px)]" />
+                <div className="pointer-events-none absolute inset-0 z-10 bg-gradient-to-t from-black/85 via-transparent to-black/45" />
+                <div className="pointer-events-none absolute inset-0 z-10 opacity-[0.07] [background:repeating-linear-gradient(0deg,transparent_0_2px,#fff_2px_3px)]" />
 
                 {/* top strip */}
-                <div className="absolute left-0 right-0 top-0 flex items-start justify-between p-4">
+                <div className="absolute left-0 right-0 top-0 z-20 flex items-start justify-between p-3 sm:p-4">
                   <div className="flex flex-wrap items-center gap-1.5">
                     {isPlaying ? (
                       <span className="animate-pulse-ring flex items-center gap-1.5 rounded-full border border-red-400/40 bg-black/60 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.22em] text-red-300 backdrop-blur-md">
@@ -882,20 +1178,34 @@ export default function NowPlaying({
                   </div>
                 </div>
 
-                {/* track switching / loading overlay */}
-                {switching && !playerProblem && (
+                {/* sound unlock (only when the browser refuses autoplay audio) */}
+                {soundBlocked && !playerProblem && (
+                  <button
+                    type="button"
+                    onClick={enableSound}
+                    className="absolute left-1/2 top-1/2 z-30 flex -translate-x-1/2 -translate-y-1/2 animate-pulse-ring items-center gap-2 rounded-2xl border border-white/20 bg-black/75 px-4 py-3 backdrop-blur-md transition hover:bg-black/90"
+                  >
+                    <Volume2 className="h-4 w-4 text-cyan-300" />
+                    <span className="font-display text-[11px] font-bold uppercase tracking-[0.18em] text-white">
+                      Tap for sound
+                    </span>
+                  </button>
+                )}
+
+                {/* track switching / healing overlay */}
+                {(switching || healing) && !playerProblem && (
                   <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center bg-black/45">
                     <div className="flex items-center gap-2.5 rounded-2xl border border-white/10 bg-black/65 px-4 py-3 backdrop-blur-md">
                       <LoaderCircle className="h-4 w-4 animate-spin text-fuchsia-300" />
                       <span className="font-display text-[11px] font-bold uppercase tracking-[0.22em] text-white">
-                        loading track…
+                        {healing ? "reconnecting…" : "loading track…"}
                       </span>
                     </div>
                   </div>
                 )}
 
                 {playerProblem && (
-                  <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/75 p-5 text-center backdrop-blur-sm">
+                  <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/75 p-5 text-center backdrop-blur-sm">
                     <div className="max-w-xs rounded-3xl border border-amber-300/25 bg-black/80 p-5 shadow-[0_0_50px_rgba(251,191,36,0.18)]">
                       <AlertTriangle className="mx-auto mb-2.5 h-7 w-7 text-amber-300" />
                       <p className="font-display text-xs font-bold uppercase tracking-[0.18em] text-white">
@@ -906,10 +1216,7 @@ export default function NowPlaying({
                       </p>
                       <div className="mt-4 flex flex-wrap justify-center gap-2">
                         <button
-                          onClick={() => {
-                            retryCountRef.current = 0;
-                            rebuildPlayer();
-                          }}
+                          onClick={manualRetry}
                           className="inline-flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/10 px-3.5 py-2 text-[11px] font-bold uppercase tracking-wider text-white transition hover:bg-white/20"
                         >
                           <RefreshCw className="h-3.5 w-3.5" />
@@ -938,9 +1245,9 @@ export default function NowPlaying({
                 )}
 
                 {/* spinning vinyl chip */}
-                <div className="absolute bottom-4 right-4 hidden sm:block">
+                <div className="pointer-events-none absolute bottom-4 right-4 z-20 hidden sm:block">
                   <div
-                    className={`vinyl relative h-20 w-20 rounded-full ${
+                    className={`vinyl relative h-16 w-16 rounded-full lg:h-20 lg:w-20 ${
                       isPlaying ? "animate-spin-vinyl" : ""
                     }`}
                   >
@@ -955,16 +1262,16 @@ export default function NowPlaying({
                 </div>
 
                 {/* meta */}
-                <div className="absolute bottom-0 left-0 right-0 p-5 pr-28 sm:p-6 sm:pr-32">
+                <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-20 p-4 pr-24 sm:p-6 sm:pr-28">
                   <p className="mb-1.5 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.28em] text-cyan-300/90">
                     <UserRound className="h-3 w-3" />
                     queued by {np.addedByName}
                   </p>
-                  <h2 className="marquee-hover font-display text-lg font-bold leading-tight text-white [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2] overflow-hidden sm:text-xl">
+                  <h2 className="marquee-hover font-display text-base font-bold leading-tight text-white [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2] overflow-hidden sm:text-lg lg:text-xl">
                     {np.title}
                   </h2>
                   {np.artist && (
-                    <p className="mt-1 truncate font-serif text-base italic text-zinc-300">
+                    <p className="mt-1 truncate font-serif text-sm italic text-zinc-300 sm:text-base">
                       {np.artist}
                     </p>
                   )}
@@ -978,7 +1285,7 @@ export default function NowPlaying({
       {/* Timeline & Controls when a track is active */}
       {np && (
         <>
-          <div className="mx-auto mt-3.5 w-full max-w-[min(100%,440px)] lg:max-w-[min(100%,46dvh)]">
+          <div className={`mt-2.5 sm:mt-3.5 ${posterWidth}`}>
             <div className="flex items-center justify-between text-[11px] font-semibold tabular-nums text-zinc-500">
               <span>{formatDuration(displayPos)}</span>
               <span className="text-[10px] text-zinc-600">
@@ -1017,11 +1324,13 @@ export default function NowPlaying({
             )}
           </div>
 
-          <div className="mx-auto mt-3.5 flex w-full max-w-[min(100%,440px)] flex-wrap items-center justify-center gap-2.5 lg:max-w-[min(100%,46dvh)]">
+          <div
+            className={`mt-2.5 flex flex-wrap items-center justify-center gap-2 sm:mt-3.5 sm:gap-2.5 ${posterWidth}`}
+          >
             <div className="glass flex items-center gap-1 rounded-2xl p-1.5">
               <button
                 onClick={toggleMute}
-                className="flex h-10 w-10 items-center justify-center rounded-xl text-zinc-300 transition hover:bg-white/10 hover:text-white"
+                className="flex h-9 w-9 items-center justify-center rounded-xl text-zinc-300 transition hover:bg-white/10 hover:text-white sm:h-10 sm:w-10"
                 title={muted ? "Unmute" : "Mute"}
               >
                 {muted ? (
@@ -1046,7 +1355,7 @@ export default function NowPlaying({
               <div className="glass flex items-center gap-1 rounded-2xl p-1.5">
                 <button
                   onClick={() => adminTransport(isPlaying ? "pause" : "resume")}
-                  className="flex h-10 w-14 items-center justify-center rounded-xl bg-gradient-to-r from-violet-500 to-fuchsia-500 text-white shadow-[0_0_24px_rgba(168,85,247,0.4)] transition hover:scale-105"
+                  className="flex h-9 w-13 items-center justify-center rounded-xl bg-gradient-to-r from-violet-500 to-fuchsia-500 px-4 text-white shadow-[0_0_24px_rgba(168,85,247,0.4)] transition hover:scale-105 sm:h-10"
                   title={isPlaying ? "Pause for everyone" : "Play for everyone"}
                 >
                   {isPlaying ? (
@@ -1057,7 +1366,7 @@ export default function NowPlaying({
                 </button>
                 <button
                   onClick={() => adminTransport("skip")}
-                  className="flex h-10 w-10 items-center justify-center rounded-xl text-zinc-300 transition hover:bg-white/10 hover:text-white"
+                  className="flex h-9 w-9 items-center justify-center rounded-xl text-zinc-300 transition hover:bg-white/10 hover:text-white sm:h-10 sm:w-10"
                   title="Skip track"
                 >
                   <SkipForward className="h-4.5 w-4.5" />
@@ -1066,9 +1375,7 @@ export default function NowPlaying({
             )}
 
             {!ready && (
-              <span className="text-xs text-zinc-500">
-                warming up the deck…
-              </span>
+              <span className="text-xs text-zinc-500">warming up the deck…</span>
             )}
           </div>
         </>

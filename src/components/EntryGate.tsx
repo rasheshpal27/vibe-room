@@ -11,6 +11,7 @@ import {
   LoaderCircle,
 } from "lucide-react";
 import Aurora from "./Aurora";
+import { markAudioUnlocked } from "@/lib/audio-unlock";
 
 export interface JoinedUser {
   id: string;
@@ -38,6 +39,9 @@ export default function EntryGate({ onJoined }: { onJoined: (u: JoinedUser) => v
 
   const submitJoin = async (e?: React.FormEvent) => {
     e?.preventDefault();
+    // Joining is a real user gesture: it is what lets the deck start with
+    // sound already on instead of a "tap for sound" prompt.
+    markAudioUnlocked();
     if (busy) return;
     const cleanName = name.trim();
     const cleanPassword = password.trim();
