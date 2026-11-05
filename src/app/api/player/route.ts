@@ -25,9 +25,40 @@ export async function POST(req: NextRequest) {
   if (action === "ended") {
     const qid = Number(body.queueId ?? 0);
     if (state.currentQueueId && qid === state.currentQueueId) {
-      await advanceQueue();
+      // Pass the id so simultaneous reports from every guest can only ever
+      // advance this one track (otherwise the room skips a song).
+      await advanceQueue(qid);
     }
     return NextResponse.json({ ok: true });
+  }
+
+  /**
+   * Any client may correct the stored duration: search providers sometimes
+   * report a wrong length, which freezes the progress bar and makes the
+   * server cut the song short. Only applies to the track that is playing.
+   */
+  if (action === "duration") {
+    const qid = Number(body.queueId ?? 0);
+    const seconds = Math.round(Number(body.durationSec ?? 0));
+    if (
+      state.currentQueueId &&
+      qid === state.currentQueueId &&
+      Number.isFinite(seconds) &&
+      seconds >= 20 &&
+      seconds <= 7200 &&
+      Math.abs(seconds - (state.durationSec ?? 0)) > 2
+    ) {
+      await db
+        .update(partyState)
+        .set({ durationSec: seconds })
+        .where(eq(partyState.id, STATE_ID));
+      await db
+        .update(queueItems)
+        .set({ durationSec: seconds })
+        .where(eq(queueItems.id, qid));
+      return NextResponse.json({ ok: true, updated: true });
+    }
+    return NextResponse.json({ ok: true, updated: false });
   }
 
   /**
@@ -47,7 +78,7 @@ export async function POST(req: NextRequest) {
       await systemMessage(
         `Skipped "${state.title ?? "that track"}" — YouTube blocks it from playing here`
       );
-      await advanceQueue();
+      await advanceQueue(qid);
       return NextResponse.json({ ok: true, skipped: true });
     }
     return NextResponse.json({ ok: true, skipped: false });

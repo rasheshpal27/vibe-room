@@ -7,7 +7,10 @@ Tests cover:
 2. Stable YouTube player hosts, cancelled startup, retry creation, and resetting rejected API loads (`src/lib/yt-loader.ts`).
 3. World-clock exact millisecond synchronization using multi-sample NTP-style RTT filtering anchored to `performance.now()` (`src/lib/clock.ts`).
 4. Contextual & curated song suggestions for the queue (`src/lib/suggestions.ts` & `/api/suggestions`).
-5. Same-page Name + Password entry (`src/components/EntryGate.tsx`) and full Queue History (`status === "done"`) with scroll-up support and "Next playing" icon indicator (`src/components/QueuePanel.tsx`).
+5. Playhead store fan-out, single-advance queue guard, duration self-repair, poll hygiene,
+   seek hysteresis, reload-without-a-sound-prompt, host-only controls, PC-first layout and the
+   transparent lyrics panel (round 2 audit).
+6. Same-page Name + Password entry (`src/components/EntryGate.tsx`) and full Queue History (`status === "done"`) with scroll-up support and "Next playing" icon indicator (`src/components/QueuePanel.tsx`).
 
 ## Song changes heal themselves (no page refresh)
 
@@ -26,15 +29,22 @@ Errors reported for a track the deck already moved past are ignored, `ended` is 
 per queue item, and the recovery card only appears after the automatic ladder has been
 exhausted — it keeps retrying in the background while it is visible.
 
-## Sound is on by default
+## Sound is on by default — including after a reload
 
-`src/lib/audio-unlock.ts` records the document's first user gesture (listeners are installed in
-`src/app/page.tsx` before anything is clickable, and `EntryGate` marks the join press). When the
-document already has activation — the normal join flow — the player is created unmuted and
-plays with sound immediately. After a cold reload with no gesture it starts muted and in sync,
-shows the room's own "Tap for sound" pill, and unmutes on the first tap anywhere, including on
-the video itself (a transparent catcher covers the iframe, so YouTube's own unmute overlay is
-never reachable).
+The deck no longer *assumes* a reload needs muting. The player is always created **unmuted**
+(unless the listener muted it themselves) and tries to play with sound. Only if the browser
+actually refuses — the player is still not PLAYING/BUFFERING `AUTOPLAY_BLOCK_MS` (1.1s) after
+the load — does it switch to muted playback, keeping the room in sync, and show the room's own
+"Tap for sound" pill. That check runs *before* the recovery ladder, so a blocked autoplay can
+never trigger an iframe rebuild, and it is armed only until the page has produced audible
+playback once (`audiblePlaybackRef`), so a slow-loading track mid-party never silences anyone.
+In practice Chrome/Edge/Firefox let a frequently used room autoplay with sound, so a refresh
+is silent-prompt-free; iOS Safari falls back to the pill after ~1.1s.
+
+`src/lib/audio-unlock.ts` still records the document's first gesture (listeners installed in
+`src/app/page.tsx`, `EntryGate` marks the join press) and unmutes on the first tap anywhere,
+including on the video itself — a transparent catcher covers the iframe, so YouTube's own
+unmute overlay is never reachable.
 
 ## Lyrics match the version that is playing
 
@@ -46,10 +56,44 @@ similarity. The panel shows which track it matched and offers "Wrong?" to cycle 
 YouTube's own subtitles stay off (`cc_load_policy: 0` plus `unloadModule("captions")` on ready,
 on `onApiChange`, and after every track load).
 
-## Layout
+## Layout — PC first
 
 Lyrics | Deck | Queue are three real columns from `md` upward, each with its own internal
-scroll area, inside a `h-dvh` flex column — the page itself never scrolls. On phones the deck
-stays pinned and visible (its iframe is never hidden or shrunk, which is what mobile browsers
-throttle) and the bottom bar swaps the panel underneath it between Lyrics, Queue, Discover and
-Chat.
+scroll area, inside a `h-dvh` flex column — the page itself never scrolls. The lyrics column is
+the widest it has ever been (`xl:grid-cols-[minmax(380px,1fr)_minmax(460px,1.05fr)_420px]`).
+
+Phones get one full-screen panel at a time, chosen from a five-way bottom bar
+(**Deck · Lyrics · Queue · Find · Chat**, Deck first). The deck is never unmounted, never
+`display:none`, and never shrunk — mobile browsers throttle hidden or 1×1 iframes and the room
+would drift out of sync. When another tab is up it keeps its full size behind it with
+`absolute inset-0 opacity-0 pointer-events-none`; on `md` and up those classes are dropped and
+it is simply the middle column again.
+
+## Lyrics panel
+
+No card, no border, no backdrop: the words sit straight on the room's aurora
+(`maskImage` fades them out at the top and bottom), padding drops to `px-1 sm:px-2` so the text
+gets the whole column, the active line is `text-2xl lg:text-3xl` and the rest `text-lg
+lg:text-xl`.
+
+## Host-only deck controls
+
+Guests see the artwork, the track meta and a **read-only** progress bar with elapsed/total
+times. The volume slider, mute button, play/pause, skip, the scrubber, the millisecond readout,
+the UTC resync chip and the admin dock are all behind `isAdmin`. The "Tap for sound" pill stays
+visible to everyone — it is the only escape hatch when a browser blocks audio.
+
+## Sync and ping audit
+
+| Problem found | Fix |
+| --- | --- |
+| Every guest POSTs `ended`; the `currentQueueId` check happened before the row lock, so the second request advanced the queue again and **silently skipped a song** | `advanceQueue(expectedQueueId)` re-checks the id *inside* the locked transaction; `/api/player` passes it for `ended` and `unplayable` |
+| `lastSeen` was rewritten on every 1s poll (N writes/second) | heartbeat only fires when the row is older than `HEARTBEAT_MIN_INTERVAL_MS` (20s); the 90s online cutoff is unchanged |
+| `getSnapshot` selected *every* `queueItems` row forever | four bounded queries: queued ≤80, history ≤30 (newest, reversed), users ≤100, chat ≤60 |
+| A wrong `durationSec` froze the progress bar and made the server cut the song at `duration + 15s` | the deck reports `player.getDuration()` once per track via `POST /api/player {action:"duration"}`; the server validates 20–7200s and only writes when it differs by >2s |
+| The 100ms position tick lifted the playhead into shell state → the whole party re-rendered 10×/s | `src/lib/playhead.ts`: the deck publishes, the lyrics subscribe and only `setState` when the highlighted line changes; the shell holds no playhead state |
+| 0.25s seek tolerance + 1.2s cooldown re-seeked on measurement noise (audible stutter) | 0.3s tolerance, **two consecutive** breaches required, 2s cooldown; `playVideo()` nudges rate-limited to 900ms |
+| Polls overlapped on slow links and kept running in background tabs | one in-flight request at a time, `AbortSignal.timeout(8000)`, paused while `document.hidden`, instant refresh on visibility/focus/online |
+| Every poll re-rendered the room even when nothing changed | `renderSignature()` ignores `serverNow`/heartbeat timestamps; identical snapshots skip `setState` entirely. `SearchPanel`/`ChatPanel` are memoised |
+| A full-screen film-grain layer animated 4 steps/0.9s forever | the grain is now static, and `prefers-reduced-motion` disables the aurora, spin, pulse and marquee |
+| `setUnreadChat` ran inside the `setSnap` updater (impure, double-fires in StrictMode) | unread counting moved out of the updater and is suppressed for the first snapshot |

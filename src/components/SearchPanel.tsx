@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   Search,
   Plus,
@@ -38,7 +38,7 @@ const MOOD_ICONS: Record<string, React.ReactNode> = {
   guitar: <Guitar className="h-5 w-5" />,
 };
 
-export default function SearchPanel({
+function SearchPanel({
   me,
   refresh,
 }: {
@@ -381,3 +381,10 @@ export default function SearchPanel({
     </div>
   );
 }
+
+/**
+ * The room snapshot refreshes once a second; none of it reaches this panel,
+ * so memoising it keeps search results and the typing cursor untouched by
+ * the poll loop.
+ */
+export default memo(SearchPanel);

@@ -297,3 +297,161 @@ test('UI keeps lyrics, deck and queue side by side with automatic sound and self
   const playerRoute = fs.readFileSync('src/app/api/player/route.ts', 'utf8');
   assert.ok(playerRoute.includes('"unplayable"'), 'Server can skip a video nobody can embed');
 });
+
+/* ------------------------------------------------------------------ *
+ * Round 2: sync/ping audit, PC-first layout, transparent lyrics,
+ * host-only deck controls, and no sound prompt after a reload.
+ * ------------------------------------------------------------------ */
+
+test('playhead store replays the current position and stops on unsubscribe', () => {
+  const { setPlayhead, getPlayhead, subscribePlayhead } = load('src/lib/playhead.ts');
+  setPlayhead(42.5);
+  const seen = [];
+  const stop = subscribePlayhead((s) => seen.push(s));
+  assert.deepEqual(seen, [42.5], 'subscribing immediately replays the latest position');
+  setPlayhead(43);
+  setPlayhead(Number.NaN);
+  assert.deepEqual(seen, [42.5, 43, 0], 'updates stream through and garbage is clamped to 0');
+  stop();
+  setPlayhead(99);
+  assert.deepEqual(seen, [42.5, 43, 0], 'no updates after unsubscribe');
+  assert.equal(getPlayhead(), 99);
+
+  const throwing = subscribePlayhead(() => { throw new Error('bad subscriber'); });
+  assert.doesNotThrow(() => setPlayhead(100), 'a broken subscriber never breaks playback');
+  throwing();
+});
+
+test('simultaneous "ended" reports can only advance the queue once', () => {
+  const partyCode = fs.readFileSync('src/lib/party.ts', 'utf8');
+  assert.ok(/export async function advanceQueue\(expectedQueueId\?: number \| null\)/.test(partyCode),
+    'advanceQueue takes the track the caller believes is playing');
+  const body = partyCode.slice(partyCode.indexOf('export async function advanceQueue'));
+  const lockAt = body.indexOf(".for(\"update\")");
+  const guardAt = body.indexOf('currentQueueId !== expectedQueueId');
+  const promoteAt = body.indexOf('status: "done"');
+  assert.ok(lockAt > -1 && guardAt > lockAt && promoteAt > guardAt,
+    'the guard is re-checked after the row lock, before anything is promoted');
+
+  const playerRoute = fs.readFileSync('src/app/api/player/route.ts', 'utf8');
+  const ended = playerRoute.slice(playerRoute.indexOf('action === "ended"'));
+  assert.ok(ended.slice(0, 400).includes('advanceQueue(qid)'),
+    'the ended handler forwards the queue id it saw');
+});
+
+test('a wrong track duration is repaired instead of cutting the song off', () => {
+  const playerRoute = fs.readFileSync('src/app/api/player/route.ts', 'utf8');
+  const duration = playerRoute.slice(playerRoute.indexOf('action === "duration"'));
+  assert.ok(duration.includes('qid === state.currentQueueId'), 'only the playing track can be corrected');
+  assert.ok(duration.includes('seconds >= 20') && duration.includes('seconds <= 7200'),
+    'absurd durations are rejected');
+  assert.ok(duration.includes('Math.abs(seconds - (state.durationSec ?? 0)) > 2'),
+    'no write unless it actually differs (idempotent for every other guest)');
+
+  const nowPlayingCode = fs.readFileSync('src/components/NowPlaying.tsx', 'utf8');
+  assert.ok(nowPlayingCode.includes('reportedDurationRef'), 'each client reports at most once per track');
+  assert.ok(nowPlayingCode.includes('"duration"'), 'the real player duration is sent back to the room');
+});
+
+test('the room poll is quiet: bounded payload, throttled heartbeat, no overlap, paused when hidden', () => {
+  const partyCode = fs.readFileSync('src/lib/party.ts', 'utf8');
+  assert.ok(partyCode.includes('HEARTBEAT_MIN_INTERVAL_MS') && partyCode.includes('lt(users.lastSeen'),
+    'lastSeen is only written when it is stale, not on every poll');
+  assert.ok(partyCode.includes('.limit(MAX_QUEUE_ROWS)') && partyCode.includes('.limit(MAX_HISTORY_ROWS)') &&
+    partyCode.includes('.limit(MAX_CHAT_ROWS)'), 'an all-night party cannot grow the poll payload');
+
+  const shellCode = fs.readFileSync('src/components/PartyShell.tsx', 'utf8');
+  assert.ok(shellCode.includes('inFlightRef'), 'one state request at a time');
+  assert.ok(shellCode.includes('AbortSignal.timeout(POLL_TIMEOUT_MS)'), 'a hung poll cannot wedge the loop');
+  assert.ok(shellCode.includes('if (!document.hidden) refresh()'), 'a background tab stops polling');
+  assert.ok(shellCode.includes('visibilitychange') && shellCode.includes('"online"'),
+    'coming back refreshes immediately instead of waiting out the interval');
+  assert.ok(shellCode.includes('renderSignature'), 'identical snapshots do not re-render the room');
+});
+
+test('the deck publishes the playhead instead of re-rendering the whole party', () => {
+  const nowPlayingCode = fs.readFileSync('src/components/NowPlaying.tsx', 'utf8');
+  assert.ok(nowPlayingCode.includes('setPlayhead('), 'the deck publishes to the store');
+  assert.ok(!nowPlayingCode.includes('onPositionChange'), 'no per-tick callback into the parent');
+
+  const shellCode = fs.readFileSync('src/components/PartyShell.tsx', 'utf8');
+  assert.ok(!shellCode.includes('playheadSec'), 'the shell holds no playhead state');
+
+  const lyricsCode = fs.readFileSync('src/components/LyricsOverlay.tsx', 'utf8');
+  assert.ok(lyricsCode.includes('subscribePlayhead'), 'lyrics subscribe to the playhead directly');
+  assert.ok(lyricsCode.includes('prev === next ? prev : next'),
+    'lyrics only re-render when the highlighted line changes');
+
+  const css = fs.readFileSync('src/app/globals.css', 'utf8');
+  assert.ok(!css.includes('animation: grainShift'), 'the full-screen grain layer no longer repaints forever');
+  assert.ok(css.includes('prefers-reduced-motion'), 'ambient animation honours the OS setting');
+});
+
+test('corrective seeks need two strikes and a cooldown so playback stops stuttering', () => {
+  const code = fs.readFileSync('src/components/NowPlaying.tsx', 'utf8');
+  assert.match(code, /SEEK_TOLERANCE_SEC = 0\.3/);
+  assert.match(code, /SEEK_STRIKES_BEFORE_SEEK = 2/);
+  assert.match(code, /SEEK_COOLDOWN_MS = 2000/);
+  assert.ok(code.includes('driftStrikesRef.current >= SEEK_STRIKES_BEFORE_SEEK'),
+    'a single noisy sample never triggers a seek');
+  assert.ok(code.includes('PLAY_NUDGE_COOLDOWN_MS'), 'play() nudges are rate limited');
+});
+
+test('reloading the page does not bring back the "Tap for sound" prompt', () => {
+  const code = fs.readFileSync('src/components/NowPlaying.tsx', 'utf8');
+  const muteOnStart = code.slice(code.indexOf('const muteOnStart'), code.indexOf('const muteOnStart') + 220);
+  assert.ok(!muteOnStart.includes('soundAllowedRef'),
+    'a fresh page always tries unmuted playback instead of pre-emptively muting');
+  assert.match(code, /AUTOPLAY_BLOCK_MS = 1100/);
+  assert.ok(code.includes('!audiblePlaybackRef.current'),
+    'only the first load can fall back to muted; a slow track never silences the room');
+  const blockAt = code.indexOf('msSinceLoad > AUTOPLAY_BLOCK_MS');
+  const ladderAt = code.indexOf('loadNeverStarted');
+  assert.ok(blockAt > -1 && blockAt < ladderAt,
+    'a blocked autoplay is handled before the recovery ladder can rebuild the player');
+});
+
+test('deck controls belong to the host only', () => {
+  const code = fs.readFileSync('src/components/NowPlaying.tsx', 'utf8');
+  const gate = code.indexOf('{np && isAdmin && (');
+  assert.ok(gate > -1, 'the control cluster is gated on isAdmin');
+  for (const marker of ['aria-label="Volume"', 'Pause for everyone', 'Skip track']) {
+    assert.ok(code.indexOf(marker) > gate, `${marker} is inside the host-only block`);
+  }
+  const progress = code.slice(code.indexOf('Progress — read-only for guests'), gate);
+  assert.ok(progress.indexOf('isAdmin && duration > 0 ?') < progress.indexOf('aria-label="Seek"'),
+    'only the host can scrub');
+  assert.ok(progress.includes('bg-gradient-to-r from-violet-400'),
+    'guests still see where the song is, they just cannot move it');
+  const recoverySkip = code.slice(code.indexOf('Playback recovery'), gate);
+  assert.ok(/isAdmin && \(\s*<button\s+onClick=\{\(\) => adminTransport\("skip"\)\}/.test(recoverySkip),
+    'even the recovery overlay only offers Skip to the host');
+  assert.ok(code.includes('{isAdmin && (') && code.indexOf('resyncExactMs') > -1,
+    'the clock chip is a host tool as well');
+  assert.ok(code.includes('{soundBlocked && !playerProblem && ('),
+    'the sound escape hatch stays available to everyone');
+});
+
+test('PC gets three columns, the phone gets one panel at a time with the deck alive', () => {
+  const shellCode = fs.readFileSync('src/components/PartyShell.tsx', 'utf8');
+  assert.ok(shellCode.includes('xl:grid-cols-[minmax(380px,1fr)_minmax(460px,1.05fr)_420px]'),
+    'wide screens get a generous lyrics column');
+  assert.ok(shellCode.includes('grid-cols-5'), 'the phone switcher exposes Deck too');
+  const deck = shellCode.slice(shellCode.indexOf('aria-label="Deck"'), shellCode.indexOf('aria-label="Lyrics"'));
+  assert.ok(deck.includes('absolute inset-0') && deck.includes('opacity-0') && deck.includes('pointer-events-none'),
+    'an inactive deck stays full size and mounted (hidden iframes get throttled)');
+  assert.ok(!/hidden/.test(deck), 'the deck is never display:none');
+  assert.ok(deck.includes('md:static') && deck.includes('md:opacity-100'),
+    'on a laptop the deck is just the middle column again');
+});
+
+test('the lyrics panel is transparent, wide and readable', () => {
+  const code = fs.readFileSync('src/components/LyricsOverlay.tsx', 'utf8');
+  assert.ok(!code.includes('glass-deep'), 'no card background behind the words');
+  assert.ok(!/border border-white\/10/.test(code.slice(code.indexOf('<section'), code.indexOf('<header'))),
+    'no framing border around the column');
+  assert.ok(code.includes('maskImage'), 'lines fade out at the top and bottom instead of being clipped');
+  assert.ok(code.includes('px-1 sm:px-2'), 'margins give the text the full column width');
+  assert.ok(code.includes('text-2xl') && code.includes('lg:text-3xl'), 'the active line is large');
+  assert.ok(code.includes('text-lg') && code.includes('lg:text-xl'), 'surrounding lines are readable too');
+});
