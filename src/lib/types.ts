@@ -33,7 +33,7 @@ export interface ChatMessageDTO {
 }
 
 export interface PartySnapshot {
-  serverNow: number; // ms epoch
+  serverNow: number; // UTC ms epoch
   party: {
     isOpen: boolean;
     isPlaying: boolean;
@@ -48,9 +48,13 @@ export interface PartySnapshot {
     title: string;
     artist: string;
     thumbnail: string;
+    durationSec: number;
     addedByName: string;
   } | null;
+  /** Upcoming queued songs (status === "queued") */
   queue: QueueItemDTO[];
+  /** Previously played songs in this party session (status === "done"), ordered chronologically */
+  history: QueueItemDTO[];
   users: UserDTO[];
   chat: ChatMessageDTO[];
   you: UserDTO | null;

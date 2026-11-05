@@ -14,14 +14,28 @@ import {
   AlertTriangle,
   ExternalLink,
   LoaderCircle,
+  Clock,
+  MicVocal,
 } from "lucide-react";
+import LyricsOverlay from "./LyricsOverlay";
 import { createPlayer, YT_STATE, type YTPlayer } from "@/lib/yt-loader";
+import {
+  computeExpectedPosition,
+  createClockSample,
+  getWorldNowMs,
+  selectBestClockAnchor,
+  type ClockSample,
+  type ClockSyncState,
+} from "@/lib/clock";
 import { formatDuration, type PartySnapshot } from "@/lib/types";
 
-// How far off the player may drift from the shared timeline before we nudge it.
-const SEEK_TOLERANCE_SEC = 1.0;
-// Minimum time between two corrective seeks (avoids stutter loops).
-const SEEK_COOLDOWN_MS = 1500;
+// Tight millisecond-level drift threshold (250ms) against the shared world clock.
+const SEEK_TOLERANCE_SEC = 0.25;
+// Minimum time between two corrective seeks (avoids decoder stutter loops).
+const SEEK_COOLDOWN_MS = 1200;
+// Small lead compensation (40ms) when issuing an active seek so decoder buffer
+// resume lands right on the world-clock playhead.
+const SEEK_LEAD_SEC = 0.04;
 
 export default function NowPlaying({
   snap,
@@ -34,15 +48,37 @@ export default function NowPlaying({
   onPlayerAction: (action: string, extra?: Record<string, unknown>) => Promise<void>;
   onGoDiscover: () => void;
 }) {
+  // Lyrics are displayed inline on the home page and ON by default.
+  const [lyricsOpen, setLyricsOpen] = useState(true);
+  const lifecycleRef = useRef(new AbortController());
+  const mutedRef = useRef(false);
   const mountRef = useRef<HTMLDivElement | null>(null);
   const preloadMountRef = useRef<HTMLDivElement | null>(null);
   const playerRef = useRef<YTPlayer | null>(null); // the visible player
   const preloadRef = useRef<YTPlayer | null>(null); // hidden, holds the next track
   const readyRef = useRef(false);
   const appliedQidRef = useRef<number | null>(null);
-  const offsetRef = useRef(0); // serverClock - localClock (RTT corrected)
+
+  // High-precision monotonic world-clock sync state
+  const clockSamplesRef = useRef<ClockSample[]>([]);
+  const clockStateRef = useRef<ClockSyncState>({
+    utcAtMonoZero:
+      Date.now() - (typeof performance !== "undefined" ? performance.now() : 0),
+    offsetMs: 0,
+    bestRttMs: Infinity,
+    sampleCount: 0,
+    synced: false,
+  });
+  const [clockBadge, setClockBadge] = useState<{
+    synced: boolean;
+    rttMs: number;
+    driftMs: number;
+  }>({ synced: false, rttMs: 0, driftMs: 0 });
+
   const snapRef = useRef<PartySnapshot | null>(null);
-  snapRef.current = snap;
+  useEffect(() => {
+    snapRef.current = snap;
+  }, [snap]);
 
   const [ready, setReady] = useState(false);
   const [muted, setMuted] = useState(false);
@@ -67,59 +103,79 @@ export default function NowPlaying({
   const lastSeekAtRef = useRef(0);
   const soundEnabledRef = useRef(false);
   const volumeRef = useRef(80);
-  const bestRttRef = useRef(Infinity);
-  const clockSyncedRef = useRef(false);
   const onPlayerActionRef = useRef(onPlayerAction);
 
   // keep the latest prop/state available to interval + event callbacks
   useEffect(() => {
     volumeRef.current = volume;
-  }, [volume]);
+    mutedRef.current = muted;
+  }, [volume, muted]);
   useEffect(() => {
     onPlayerActionRef.current = onPlayerAction;
   }, [onPlayerAction]);
 
-  /* ---------- server-relative "now" (RTT-compensated clock) ---------- */
-  const serverNow = useCallback(() => Date.now() + offsetRef.current, []);
+  /* ---------- world-clock "now" in exact UTC milliseconds ---------- */
+  const worldNowMs = useCallback(() => {
+    return getWorldNowMs(
+      clockStateRef.current,
+      Date.now(),
+      typeof performance !== "undefined" ? performance.now() : 0
+    );
+  }, []);
 
-  /* ---------- compute expected position on the shared timeline ---------- */
+  /* ---------- compute expected position on the shared world timeline ---------- */
   const expectedPos = useCallback(() => {
     const s = snapRef.current;
     if (!s) return 0;
-    const drift = s.party.isPlaying
-      ? Math.max(0, (serverNow() - s.party.updatedAtMs) / 1000)
-      : 0;
-    return s.party.positionSec + drift;
-  }, [serverNow]);
+    return computeExpectedPosition(s.party, worldNowMs()).positionSec;
+  }, [worldNowMs]);
 
-  /* ---------- NTP-style clock sync against the app server ---------- */
-  useEffect(() => {
-    let cancelled = false;
-    const sample = async () => {
+  /* ---------- Multi-sample NTP burst clock sync against UTC world clock ---------- */
+  const runClockBurst = useCallback(async (burstCount = 4) => {
+    for (let i = 0; i < burstCount; i++) {
       try {
         const t0 = performance.now();
         const res = await fetch("/api/time", { cache: "no-store" });
         const t1 = performance.now();
-        if (!res.ok || cancelled) return;
-        const data = (await res.json()) as { t?: number };
-        if (!Number.isFinite(data.t)) return;
-        const rtt = t1 - t0;
-        // serverTime at receive ≈ t + rtt/2; offset maps local→server time.
-        const offset = (data.t as number) + rtt / 2 - Date.now();
-        // keep the lowest-RTT sample (most accurate), like NTP
-        if (!clockSyncedRef.current || rtt < bestRttRef.current) {
-          bestRttRef.current = rtt;
-          offsetRef.current = offset;
-          clockSyncedRef.current = true;
-        }
+        if (!res.ok) continue;
+        const data = (await res.json()) as { utcMs?: number; t?: number };
+        const serverUtcMs = Number(data.utcMs ?? data.t);
+        if (!Number.isFinite(serverUtcMs)) continue;
+
+        const sample = createClockSample(t0, t1, serverUtcMs);
+        clockSamplesRef.current = [...clockSamplesRef.current.slice(-11), sample];
+        const nextState = selectBestClockAnchor(
+          clockSamplesRef.current,
+          Date.now(),
+          performance.now()
+        );
+        clockStateRef.current = nextState;
+        setClockBadge((prev) => ({
+          ...prev,
+          synced: nextState.synced,
+          rttMs: Math.round(nextState.bestRttMs),
+        }));
       } catch {
-        /* keep previous offset */
+        /* keep previous anchor */
       }
-    };
-    sample();
-    const iv = window.setInterval(sample, 20000);
+      if (i < burstCount - 1) {
+        await new Promise((r) => setTimeout(r, 120));
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!cancelled) await runClockBurst(4);
+    })();
+    const iv = window.setInterval(() => {
+      if (!cancelled) runClockBurst(2);
+    }, 15000);
     const onVis = () => {
-      if (document.visibilityState === "visible") sample();
+      if (document.visibilityState === "visible" && !cancelled) {
+        runClockBurst(3);
+      }
     };
     document.addEventListener("visibilitychange", onVis);
     return () => {
@@ -127,12 +183,19 @@ export default function NowPlaying({
       window.clearInterval(iv);
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, []);
+  }, [runClockBurst]);
 
-  // Fallback until the first clock sample lands: use the snapshot timestamp.
+  // Fallback until the first NTP burst sample lands: use snapshot serverNow.
   useEffect(() => {
-    if (!snap || clockSyncedRef.current) return;
-    offsetRef.current = snap.serverNow - Date.now();
+    if (!snap || clockStateRef.current.synced) return;
+    const monoNow = typeof performance !== "undefined" ? performance.now() : 0;
+    clockStateRef.current = {
+      utcAtMonoZero: snap.serverNow - monoNow,
+      offsetMs: snap.serverNow - Date.now(),
+      bestRttMs: Infinity,
+      sampleCount: 1,
+      synced: true,
+    };
   }, [snap]);
 
   /* ---------- shared player event handlers (both players) ---------- */
@@ -144,21 +207,23 @@ export default function NowPlaying({
         const s = snapRef.current;
         const qid = appliedQidRef.current;
         if (s?.nowPlaying && qid) {
-          // let the server advance, then refresh immediately for a fast swap
           onPlayerActionRef.current("ended", { queueId: qid }).catch(() => undefined);
         }
         return;
       }
-      // one precise seek once the freshly loaded track is actually playable
+      // one precise millisecond seek once the freshly loaded track is playable
       if (
         (state === YT_STATE.PLAYING || state === YT_STATE.PAUSED) &&
         pendingSeekRef.current
       ) {
         pendingSeekRef.current = false;
         const p = playerRef.current;
-        if (p && snapRef.current?.nowPlaying) {
+        const s = snapRef.current;
+        if (p && s?.nowPlaying) {
           try {
-            p.seekTo(expectedPos(), true);
+            const targetSec =
+              expectedPos() + (s.party.isPlaying ? SEEK_LEAD_SEC : 0);
+            p.seekTo(targetSec, true);
             lastSeekAtRef.current = Date.now();
           } catch {
             /* ignore */
@@ -178,38 +243,71 @@ export default function NowPlaying({
     setPlayerProblem(friendly);
   }, []);
 
+  const hasTrack = !!snap?.nowPlaying;
+  useEffect(() => {
+    const controller = new AbortController();
+    lifecycleRef.current = controller;
+    return () => {
+      controller.abort();
+      try {
+        playerRef.current?.destroy();
+      } catch {
+        /* already removed */
+      }
+      try {
+        preloadRef.current?.destroy();
+      } catch {
+        /* already removed */
+      }
+      playerRef.current = null;
+      preloadRef.current = null;
+      readyRef.current = false;
+      preloadReadyRef.current = false;
+      creatingRef.current = false;
+      preloadCreatingRef.current = false;
+      appliedQidRef.current = null;
+      preloadVideoRef.current = null;
+    };
+  }, [hasTrack]);
+
   /* ---------- hidden player that preloads the next queued track ---------- */
   const ensurePreloadPlayer = useCallback(() => {
     const el = preloadMountRef.current;
     if (!el || preloadRef.current || preloadCreatingRef.current) return;
     preloadCreatingRef.current = true;
-    createPlayer(el, {
-      onReady: (pre) => {
-        preloadRef.current = pre;
-        preloadReadyRef.current = true;
-        try {
-          pre.mute();
-        } catch {
-          /* ignore */
-        }
-        const next = snapRef.current?.queue?.[0];
-        if (next && preloadVideoRef.current !== next.videoId) {
-          preloadVideoRef.current = next.videoId;
+    const signal = lifecycleRef.current.signal;
+    createPlayer(
+      el,
+      {
+        onReady: (pre) => {
+          preloadRef.current = pre;
+          preloadReadyRef.current = true;
           try {
-            pre.loadVideoById({ videoId: next.videoId });
+            pre.mute();
           } catch {
             /* ignore */
           }
-        }
+          const next = snapRef.current?.queue?.[0];
+          if (next && preloadVideoRef.current !== next.videoId) {
+            preloadVideoRef.current = next.videoId;
+            try {
+              pre.cueVideoById(next.videoId);
+            } catch {
+              /* ignore */
+            }
+          }
+        },
+        onStateChange: handleStateChange,
+        onError: handleError,
       },
-      onStateChange: handleStateChange,
-      onError: handleError,
-    })
+      signal
+    )
       .catch(() => {
+        if (signal.aborted) return;
         preloadRef.current = null;
       })
       .finally(() => {
-        preloadCreatingRef.current = false;
+        if (!signal.aborted) preloadCreatingRef.current = false;
       });
   }, [handleStateChange, handleError]);
 
@@ -223,7 +321,7 @@ export default function NowPlaying({
       preloadVideoRef.current = next.videoId;
       try {
         pre.mute();
-        pre.loadVideoById({ videoId: next.videoId });
+        pre.cueVideoById(next.videoId);
       } catch {
         /* ignore */
       }
@@ -258,7 +356,7 @@ export default function NowPlaying({
       preloadVideoRef.current = next.videoId;
       try {
         main.mute();
-        main.loadVideoById({ videoId: next.videoId });
+        main.cueVideoById(next.videoId);
       } catch {
         /* ignore */
       }
@@ -266,145 +364,181 @@ export default function NowPlaying({
     return true;
   }, []);
 
-  /* ---------- sync the visible player with the server ---------- */
-  const sync = useCallback(() => {
-    const player = playerRef.current;
-    const s = snapRef.current;
-    if (!player || !readyRef.current || !s) return;
+  /* ---------- sync the visible player with the world clock ---------- */
+  const sync = useCallback(
+    (forceSeek = false) => {
+      const player = playerRef.current;
+      const s = snapRef.current;
+      if (!player || !readyRef.current || !s) return;
 
-    const np = s.nowPlaying;
-    const p = s.party;
-    const expected = expectedPos();
+      const np = s.nowPlaying;
+      const p = s.party;
+      const expected = expectedPos();
 
-    try {
-      if (np && np.videoId) {
-        if (appliedQidRef.current !== np.queueId) {
-          appliedQidRef.current = np.queueId;
-          setLoadedQid(np.queueId);
-          setPlayerProblem("");
+      try {
+        if (np && np.videoId) {
+          if (appliedQidRef.current !== np.queueId) {
+            appliedQidRef.current = np.queueId;
+            setLoadedQid(np.queueId);
+            setPlayerProblem("");
 
-          const pre = preloadRef.current;
-          const canSwap =
-            pre && preloadReadyRef.current && preloadVideoRef.current === np.videoId;
+            const pre = preloadRef.current;
+            const canSwap =
+              pre && preloadReadyRef.current && preloadVideoRef.current === np.videoId;
 
-          if (canSwap && swapPlayers()) {
-            const main = playerRef.current;
-            if (main) {
-              try {
-                main.unMute();
-                main.setVolume(volumeRef.current);
-                main.seekTo(expected, true);
-                if (p.isPlaying) main.playVideo();
-                else main.pauseVideo();
-              } catch {
-                /* ignore */
+            if (canSwap && swapPlayers()) {
+              const main = playerRef.current;
+              if (main) {
+                try {
+                  if (soundEnabledRef.current && !mutedRef.current) main.unMute();
+                  else main.mute();
+                  main.setVolume(volumeRef.current);
+                  main.seekTo(expected + (p.isPlaying ? SEEK_LEAD_SEC : 0), true);
+                  if (p.isPlaying) main.playVideo();
+                  else main.pauseVideo();
+                } catch {
+                  /* ignore */
+                }
+              }
+            } else {
+              if (p.isPlaying)
+                player.loadVideoById({
+                  videoId: np.videoId,
+                  startSeconds: expected + SEEK_LEAD_SEC,
+                });
+              else
+                player.cueVideoById({
+                  videoId: np.videoId,
+                  startSeconds: expected,
+                });
+            }
+            pendingSeekRef.current = true;
+            return;
+          }
+
+          const st = player.getPlayerState();
+
+          // Muted autoplay can start before the user unlocks audio.
+          if (p.isPlaying) {
+            if (st !== YT_STATE.PLAYING && st !== YT_STATE.BUFFERING) {
+              player.playVideo();
+            }
+          } else if (!p.isPlaying) {
+            if (st === YT_STATE.PLAYING || st === YT_STATE.BUFFERING) {
+              player.pauseVideo();
+            }
+          }
+
+          // Millisecond drift tracking & corrective seek when settled
+          if (st === YT_STATE.PLAYING || st === YT_STATE.PAUSED) {
+            const cur = player.getCurrentTime();
+            if (Number.isFinite(cur)) {
+              const driftSec = cur - expected;
+              const driftMs = Math.round(driftSec * 1000);
+              setClockBadge((prev) =>
+                prev.driftMs === driftMs ? prev : { ...prev, driftMs }
+              );
+
+              if (
+                forceSeek ||
+                (Math.abs(driftSec) > SEEK_TOLERANCE_SEC &&
+                  Date.now() - lastSeekAtRef.current > SEEK_COOLDOWN_MS)
+              ) {
+                const targetSec =
+                  expected + (p.isPlaying ? SEEK_LEAD_SEC : 0);
+                player.seekTo(targetSec, true);
+                lastSeekAtRef.current = Date.now();
               }
             }
-          } else {
-            player.loadVideoById({ videoId: np.videoId, startSeconds: expected });
-            if (!p.isPlaying) setTimeout(() => player.pauseVideo(), 400);
           }
-          pendingSeekRef.current = true;
-          return;
+        } else if (appliedQidRef.current !== null) {
+          appliedQidRef.current = null;
+          setLoadedQid(null);
+          player.stopVideo();
         }
-
-        const st = player.getPlayerState();
-
-        // play/pause alignment — never attempt autoplay until the user has
-        // unlocked sound, and never seek while buffering.
-        if (p.isPlaying && soundEnabledRef.current) {
-          if (st !== YT_STATE.PLAYING && st !== YT_STATE.BUFFERING) {
-            player.playVideo();
-          }
-        } else if (!p.isPlaying) {
-          if (st === YT_STATE.PLAYING || st === YT_STATE.BUFFERING) {
-            player.pauseVideo();
-          }
-        }
-
-        // corrective seek, cooled & only when the player is actually settled
-        if (st === YT_STATE.PLAYING || st === YT_STATE.PAUSED) {
-          const cur = player.getCurrentTime();
-          if (
-            Number.isFinite(cur) &&
-            Math.abs(cur - expected) > SEEK_TOLERANCE_SEC &&
-            Date.now() - lastSeekAtRef.current > SEEK_COOLDOWN_MS
-          ) {
-            player.seekTo(expected, true);
-            lastSeekAtRef.current = Date.now();
-          }
-        }
-      } else if (appliedQidRef.current !== null) {
-        appliedQidRef.current = null;
-        setLoadedQid(null);
-        player.stopVideo();
+      } catch {
+        /* player mid-transition */
       }
-    } catch {
-      /* player mid-transition */
-    }
-  }, [expectedPos, swapPlayers]);
+    },
+    [expectedPos, swapPlayers]
+  );
 
   /* ---------- create the visible player (once the container exists) ---------- */
   const mountPlayer = useCallback(() => {
     const el = mountRef.current;
     if (!el || playerRef.current || creatingRef.current) return;
     creatingRef.current = true;
-    createPlayer(el, {
-      onReady: (p) => {
-        playerRef.current = p;
-        readyRef.current = true;
-        p.setVolume(volumeRef.current);
-        setReady(true);
-        sync();
+    const signal = lifecycleRef.current.signal;
+    createPlayer(
+      el,
+      {
+        onReady: (p) => {
+          playerRef.current = p;
+          if (!soundEnabledRef.current || mutedRef.current) p.mute();
+          setPlayerProblem("");
+          readyRef.current = true;
+          p.setVolume(volumeRef.current);
+          setReady(true);
+          sync();
+        },
+        onStateChange: handleStateChange,
+        onError: handleError,
       },
-      onStateChange: handleStateChange,
-      onError: handleError,
-    })
+      signal
+    )
       .catch((err) => {
+        if (signal.aborted) return;
         playerRef.current = null;
-        setPlayerProblem(err instanceof Error ? err.message : "YouTube player could not start.");
+        setPlayerProblem(
+          err instanceof Error ? err.message : "YouTube player could not start."
+        );
       })
       .finally(() => {
-        creatingRef.current = false;
+        if (!signal.aborted) creatingRef.current = false;
       });
   }, [handleStateChange, handleError, sync]);
 
-  // The player container only exists once a track is showing, so (re)try
-  // mounting whenever a track appears or changes.
   useEffect(() => {
     mountPlayer();
   }, [snap?.nowPlaying?.queueId, snap?.nowPlaying?.videoId, mountPlayer]);
 
-  // If the deck is emptied (reset / end party) the container unmounts, so drop
-  // the dead player reference and let the next track re-create it fresh.
   useEffect(() => {
     if (snap?.nowPlaying) return;
-    if (playerRef.current || readyRef.current) {
-      try { playerRef.current?.destroy(); } catch { /* ignore */ }
+    {
+      try {
+        playerRef.current?.destroy();
+      } catch {
+        /* ignore */
+      }
       playerRef.current = null;
       readyRef.current = false;
       appliedQidRef.current = null;
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setReady(false);
       setLoadedQid(null);
       setSoundEnabled(false);
       soundEnabledRef.current = false;
     }
     if (preloadRef.current) {
-      try { preloadRef.current.destroy(); } catch { /* ignore */ }
+      try {
+        preloadRef.current.destroy();
+      } catch {
+        /* ignore */
+      }
       preloadRef.current = null;
       preloadReadyRef.current = false;
       preloadVideoRef.current = null;
     }
   }, [snap?.nowPlaying]);
 
-  // keep the player tightly synced with the server
+  // Keep the player tightly synced with the world clock (every 500ms)
   useEffect(() => {
-    const t = setInterval(sync, 750);
+    const t = setInterval(() => sync(false), 500);
     return () => clearInterval(t);
   }, [sync]);
 
   useEffect(() => {
-    sync();
+    sync(false);
   }, [snap, sync]);
 
   // When a fresh server state arrives, stop overriding with optimistic UI.
@@ -428,7 +562,7 @@ export default function NowPlaying({
     return () => window.clearTimeout(t);
   }, [snap?.nowPlaying, ready]);
 
-  /* ---------- smooth local progress ---------- */
+  /* ---------- high-resolution 100ms local progress anchored to world clock ---------- */
   useEffect(() => {
     const t = setInterval(() => {
       const s = snapRef.current;
@@ -437,15 +571,11 @@ export default function NowPlaying({
         return;
       }
       if (scrubbingRef.current) return; // don't fight the host's drag
-      const drift = s.party.isPlaying
-        ? Math.max(0, (serverNow() - s.party.updatedAtMs) / 1000)
-        : 0;
-      const pos = s.party.positionSec + drift;
-      const max = s.party.durationSec || Infinity;
-      setDisplayPos(Math.min(pos, max));
-    }, 250);
+      const { positionSec } = computeExpectedPosition(s.party, worldNowMs());
+      setDisplayPos(positionSec);
+    }, 100);
     return () => clearInterval(t);
-  }, [serverNow]);
+  }, [worldNowMs]);
 
   const enableSound = () => {
     const p = playerRef.current;
@@ -454,13 +584,15 @@ export default function NowPlaying({
     try {
       p.unMute();
       p.setVolume(volumeRef.current || 80);
-      p.seekTo(pos, true);
-      p.playVideo();
+      p.seekTo(
+        pos + (snapRef.current?.party.isPlaying ? SEEK_LEAD_SEC : 0),
+        true
+      );
+      if (snapRef.current?.party.isPlaying) p.playVideo();
       setMuted(false);
       setSoundEnabled(true);
       soundEnabledRef.current = true;
     } catch {
-      // YouTube may still be buffering; the next sync tick will retry.
       setSoundEnabled(true);
       soundEnabledRef.current = true;
     }
@@ -472,7 +604,7 @@ export default function NowPlaying({
     if (muted) {
       p.unMute();
       p.setVolume(volumeRef.current);
-      p.playVideo();
+      if (snapRef.current?.party.isPlaying) p.playVideo();
       setMuted(false);
       setSoundEnabled(true);
       soundEnabledRef.current = true;
@@ -492,7 +624,7 @@ export default function NowPlaying({
       setMuted(true);
     } else {
       p.unMute();
-      p.playVideo();
+      if (snapRef.current?.party.isPlaying) p.playVideo();
       setMuted(false);
       setSoundEnabled(true);
       soundEnabledRef.current = true;
@@ -502,34 +634,48 @@ export default function NowPlaying({
   const adminTransport = async (action: string) => {
     if (busyRef.current) return;
     busyRef.current = true;
-    // Apply the change locally right away for an instant, app-like feel.
     try {
       if (action === "pause") {
         setUiPlaying(false);
-        try { playerRef.current?.pauseVideo(); } catch { /* ignore */ }
+        try {
+          playerRef.current?.pauseVideo();
+        } catch {
+          /* ignore */
+        }
       } else if (action === "resume") {
         setUiPlaying(true);
         setSoundEnabled(true);
         soundEnabledRef.current = true;
         const p = playerRef.current;
         if (p) {
-          try { p.seekTo(displayPos, true); p.playVideo(); } catch { /* ignore */ }
+          try {
+            p.seekTo(displayPos + SEEK_LEAD_SEC, true);
+            p.playVideo();
+          } catch {
+            /* ignore */
+          }
         }
       } else if (action === "skip") {
         setLoadedQid(-1);
-        try { playerRef.current?.stopVideo(); } catch { /* ignore */ }
+        try {
+          playerRef.current?.stopVideo();
+        } catch {
+          /* ignore */
+        }
       }
     } catch {
       /* ignore */
     }
 
     try {
-      if (action === "pause") await onPlayerAction("pause", { positionSec: displayPos });
-      else if (action === "resume") await onPlayerAction("resume", { positionSec: displayPos });
+      if (action === "pause")
+        await onPlayerAction("pause", { positionSec: displayPos });
+      else if (action === "resume")
+        await onPlayerAction("resume", { positionSec: displayPos });
       else await onPlayerAction(action);
     } catch {
-      // revert optimistic UI — the next poll will reconcile everything else
-      if (action === "skip") setLoadedQid(snapRef.current?.nowPlaying?.queueId ?? null);
+      if (action === "skip")
+        setLoadedQid(snapRef.current?.nowPlaying?.queueId ?? null);
       setUiPlaying(null);
     } finally {
       busyRef.current = false;
@@ -539,12 +685,21 @@ export default function NowPlaying({
   const seekLocal = (sec: number) => {
     scrubbingRef.current = true;
     setDisplayPos(sec);
-    try { playerRef.current?.seekTo(sec, true); } catch { /* ignore */ }
+    try {
+      playerRef.current?.seekTo(sec, true);
+    } catch {
+      /* ignore */
+    }
   };
 
   const commitSeek = (sec: number) => {
     scrubbingRef.current = false;
     onPlayerAction("seek", { positionSec: sec }).catch(() => undefined);
+  };
+
+  const resyncExactMs = async () => {
+    await runClockBurst(3);
+    sync(true);
   };
 
   const np = snap?.nowPlaying ?? null;
@@ -597,6 +752,20 @@ export default function NowPlaying({
             </button>
           </div>
         </div>
+
+        {/* Inline home-page lyrics section (on by default, ready for the first song) */}
+        <section
+          aria-label="Home page lyrics"
+          className="glass-deep mx-auto mt-6 w-full max-w-[560px] rounded-[1.8rem] border border-white/10 px-6 py-5 text-center"
+        >
+          <p className="flex items-center justify-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.25em] text-fuchsia-300">
+            <MicVocal className="h-3.5 w-3.5" />
+            Live Lyrics · On by Default
+          </p>
+          <p className="mt-2 text-xs text-zinc-400">
+            Synced lyrics will appear right here on the home screen as soon as a song starts playing.
+          </p>
+        </section>
       </>
     );
   }
@@ -642,15 +811,29 @@ export default function NowPlaying({
 
             {/* top strip */}
             <div className="absolute left-0 right-0 top-0 flex items-start justify-between p-5">
-              {isPlaying ? (
-                <span className="animate-pulse-ring flex items-center gap-2 rounded-full border border-red-400/40 bg-black/60 px-3.5 py-1.5 text-[10px] font-bold uppercase tracking-[0.25em] text-red-300 backdrop-blur-md">
-                  <Signal className="h-3.5 w-3.5" /> live
-                </span>
-              ) : (
-                <span className="flex items-center gap-2 rounded-full border border-white/15 bg-black/60 px-3.5 py-1.5 text-[10px] font-bold uppercase tracking-[0.25em] text-zinc-300 backdrop-blur-md">
-                  <Pause className="h-3 w-3" /> paused
-                </span>
-              )}
+              <div className="flex flex-wrap items-center gap-2">
+                {isPlaying ? (
+                  <span className="animate-pulse-ring flex items-center gap-2 rounded-full border border-red-400/40 bg-black/60 px-3.5 py-1.5 text-[10px] font-bold uppercase tracking-[0.25em] text-red-300 backdrop-blur-md">
+                    <Signal className="h-3.5 w-3.5" /> live
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-2 rounded-full border border-white/15 bg-black/60 px-3.5 py-1.5 text-[10px] font-bold uppercase tracking-[0.25em] text-zinc-300 backdrop-blur-md">
+                    <Pause className="h-3 w-3" /> paused
+                  </span>
+                )}
+
+                <button
+                  type="button"
+                  onClick={resyncExactMs}
+                  title="Click to force exact millisecond world-clock resync"
+                  className="flex items-center gap-1.5 rounded-full border border-cyan-400/30 bg-black/60 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-cyan-200 backdrop-blur-md transition hover:border-cyan-300/60 hover:bg-black/80"
+                >
+                  <Clock className="h-3 w-3 text-cyan-300" />
+                  <span>
+                    UTC {clockBadge.synced ? `±${Math.abs(clockBadge.driftMs)}ms` : "syncing"}
+                  </span>
+                </button>
+              </div>
 
               {/* equalizer */}
               <div className={`flex h-6 items-end gap-[3px] ${isPlaying ? "" : "eq-paused"}`}>
@@ -701,9 +884,9 @@ export default function NowPlaying({
                     <button
                       onClick={() => {
                         setPlayerProblem("");
-                        appliedQidRef.current = null; // force a reload of this track
+                        appliedQidRef.current = null;
                         if (!playerRef.current) mountPlayer();
-                        else sync();
+                        else sync(true);
                       }}
                       className="rounded-xl border border-white/10 bg-white/10 px-4 py-2.5 text-xs font-bold uppercase tracking-widest text-white transition hover:bg-white/15"
                     >
@@ -754,10 +937,16 @@ export default function NowPlaying({
         </div>
       </div>
 
-      {/* single timeline — draggable for the host, read-only for guests */}
+      {/* single timeline — draggable for the host with sub-second precision, read-only for guests */}
       <div className="mx-auto mt-5 w-full max-w-[560px]">
         <div className="flex items-center justify-between text-[11px] font-semibold tabular-nums text-zinc-500">
           <span>{formatDuration(displayPos)}</span>
+          <span className="text-[10px] text-zinc-600">
+            {Math.floor((displayPos % 1) * 1000)
+              .toString()
+              .padStart(3, "0")}
+            ms
+          </span>
           <span>{formatDuration(duration)}</span>
         </div>
         {isAdmin && duration > 0 ? (
@@ -765,8 +954,8 @@ export default function NowPlaying({
             type="range"
             min={0}
             max={duration}
-            step={1}
-            value={Math.floor(displayPos)}
+            step={0.05}
+            value={Math.min(duration, displayPos)}
             onChange={(e) => seekLocal(Number(e.target.value))}
             onPointerUp={(e) => commitSeek(Number((e.target as HTMLInputElement).value))}
             onBlur={(e) => commitSeek(Number((e.target as HTMLInputElement).value))}
@@ -785,7 +974,7 @@ export default function NowPlaying({
       </div>
 
       {/* controls */}
-      <div className="mx-auto mt-5 flex w-full max-w-[560px] items-center justify-center gap-3">
+      <div className="mx-auto mt-5 flex w-full max-w-[560px] flex-wrap items-center justify-center gap-3">
         <div className="glass flex items-center gap-1 rounded-2xl p-1.5">
           <button
             onClick={toggleMute}
@@ -825,10 +1014,35 @@ export default function NowPlaying({
           </div>
         )}
 
+        <button
+          type="button"
+          onClick={() => setLyricsOpen((v) => !v)}
+          aria-pressed={lyricsOpen}
+          className={`flex h-12 items-center gap-2 rounded-2xl border px-4 text-xs font-bold uppercase tracking-wider transition ${
+            lyricsOpen
+              ? "border-fuchsia-400/40 bg-fuchsia-500/15 text-fuchsia-200"
+              : "border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10 hover:text-white"
+          }`}
+        >
+          <MicVocal className="h-4 w-4" />
+          Lyrics {lyricsOpen ? "On" : "Off"}
+        </button>
+
         {!ready && (
           <span className="text-xs text-zinc-500">warming up the deck…</span>
         )}
       </div>
+
+      {/* Inline Lyrics on the home page (ON by default, never a popup dialog) */}
+      {lyricsOpen && (
+        <LyricsOverlay
+          key={np.videoId}
+          title={np.title}
+          artist={np.artist}
+          position={displayPos}
+          onClose={() => setLyricsOpen(false)}
+        />
+      )}
     </div>
   );
 }

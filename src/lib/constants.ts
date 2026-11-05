@@ -1,3 +1,5 @@
+import type { SongResult } from "./types";
+
 export const PARTY_PASSWORD =
   process.env.PARTY_PASSWORD ?? "hirashesh";
 export const ADMIN_PASSWORD =
@@ -106,6 +108,98 @@ export const MOODS: Mood[] = [
     from: "#d97706",
     to: "#65a30d",
     icon: "guitar",
+  },
+];
+
+/**
+ * Curated song suggestions so users always have instant one-tap song
+ * recommendations to add to the queue (and as a fallback when YouTube search
+ * proxies are rate-limited or offline).
+ */
+export const SUGGESTED_SONGS: SongResult[] = [
+  {
+    videoId: "4NRXx6U8ABQ",
+    title: "Blinding Lights",
+    artist: "The Weeknd",
+    thumbnail: "https://i.ytimg.com/vi/4NRXx6U8ABQ/hqdefault.jpg",
+    durationSec: 200,
+  },
+  {
+    videoId: "TUVcZfQe-Kw",
+    title: "Levitating",
+    artist: "Dua Lipa",
+    thumbnail: "https://i.ytimg.com/vi/TUVcZfQe-Kw/hqdefault.jpg",
+    durationSec: 203,
+  },
+  {
+    videoId: "mRD0-GxqHVo",
+    title: "Heat Waves",
+    artist: "Glass Animals",
+    thumbnail: "https://i.ytimg.com/vi/mRD0-GxqHVo/hqdefault.jpg",
+    durationSec: 238,
+  },
+  {
+    videoId: "5GJWxDKyk3A",
+    title: "Starboy",
+    artist: "The Weeknd ft. Daft Punk",
+    thumbnail: "https://i.ytimg.com/vi/5GJWxDKyk3A/hqdefault.jpg",
+    durationSec: 230,
+  },
+  {
+    videoId: "FlsCjmMhFmw",
+    title: "One More Time",
+    artist: "Daft Punk",
+    thumbnail: "https://i.ytimg.com/vi/FlsCjmMhFmw/hqdefault.jpg",
+    durationSec: 320,
+  },
+  {
+    videoId: "JGwWNGJdvx8",
+    title: "Shape of You",
+    artist: "Ed Sheeran",
+    thumbnail: "https://i.ytimg.com/vi/JGwWNGJdvx8/hqdefault.jpg",
+    durationSec: 233,
+  },
+  {
+    videoId: "kTJczUoc26U",
+    title: "STAY",
+    artist: "The Kid LAROI & Justin Bieber",
+    thumbnail: "https://i.ytimg.com/vi/kTJczUoc26U/hqdefault.jpg",
+    durationSec: 141,
+  },
+  {
+    videoId: "H5v3kku4y6Q",
+    title: "As It Was",
+    artist: "Harry Styles",
+    thumbnail: "https://i.ytimg.com/vi/H5v3kku4y6Q/hqdefault.jpg",
+    durationSec: 167,
+  },
+  {
+    videoId: "SlPhMPnQ58k",
+    title: "Memories",
+    artist: "Maroon 5",
+    thumbnail: "https://i.ytimg.com/vi/SlPhMPnQ58k/hqdefault.jpg",
+    durationSec: 189,
+  },
+  {
+    videoId: "RLzC55ai0eo",
+    title: "Kesariya",
+    artist: "Arijit Singh & Pritam",
+    thumbnail: "https://i.ytimg.com/vi/RLzC55ai0eo/hqdefault.jpg",
+    durationSec: 268,
+  },
+  {
+    videoId: "BBAyRBTfsOU",
+    title: "Midnight City",
+    artist: "M83",
+    thumbnail: "https://i.ytimg.com/vi/BBAyRBTfsOU/hqdefault.jpg",
+    durationSec: 243,
+  },
+  {
+    videoId: "fHI8X4OXluQ",
+    title: "Save Your Tears",
+    artist: "The Weeknd",
+    thumbnail: "https://i.ytimg.com/vi/fHI8X4OXluQ/hqdefault.jpg",
+    durationSec: 215,
   },
 ];
 

@@ -143,6 +143,20 @@ export async function systemMessage(content: string) {
   });
 }
 
+function toQueueItemDTO(q: typeof queueItems.$inferSelect): QueueItemDTO {
+  return {
+    id: q.id,
+    videoId: q.videoId,
+    title: q.title,
+    artist: q.artist,
+    thumbnail: q.thumbnail,
+    durationSec: q.durationSec,
+    addedByName: q.addedByName,
+    status: q.status,
+    createdAt: q.createdAt.toISOString(),
+  };
+}
+
 export async function getSnapshot(youId?: string | null): Promise<PartySnapshot> {
   // heartbeat
   if (youId) {
@@ -165,11 +179,10 @@ export async function getSnapshot(youId?: string | null): Promise<PartySnapshot>
     }
   }
 
-  const [queuedRows, userRows, chatRows] = await Promise.all([
+  const [allQueueRows, userRows, chatRows] = await Promise.all([
     db
       .select()
       .from(queueItems)
-      .where(eq(queueItems.status, "queued"))
       .orderBy(asc(queueItems.id)),
     db.select().from(users).orderBy(asc(users.createdAt)),
     db
@@ -190,17 +203,13 @@ export async function getSnapshot(youId?: string | null): Promise<PartySnapshot>
       lastSeen: u.lastSeen.toISOString(),
     }));
 
-  const queueDto: QueueItemDTO[] = queuedRows.map((q) => ({
-    id: q.id,
-    videoId: q.videoId,
-    title: q.title,
-    artist: q.artist,
-    thumbnail: q.thumbnail,
-    durationSec: q.durationSec,
-    addedByName: q.addedByName,
-    status: q.status,
-    createdAt: q.createdAt.toISOString(),
-  }));
+  const queueDto: QueueItemDTO[] = allQueueRows
+    .filter((q) => q.status === "queued")
+    .map(toQueueItemDTO);
+
+  const historyDto: QueueItemDTO[] = allQueueRows
+    .filter((q) => q.status === "done")
+    .map(toQueueItemDTO);
 
   const chatDto: ChatMessageDTO[] = chatRows
     .map((c) => ({
@@ -236,10 +245,12 @@ export async function getSnapshot(youId?: string | null): Promise<PartySnapshot>
           title: state.title ?? "",
           artist: state.artist ?? "",
           thumbnail: state.thumbnail ?? "",
+          durationSec: state.durationSec ?? 0,
           addedByName: state.startedByName ?? "",
         }
       : null,
     queue: queueDto,
+    history: historyDto,
     users: usersDto,
     chat: chatDto,
     you,

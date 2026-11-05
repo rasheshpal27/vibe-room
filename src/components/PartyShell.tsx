@@ -60,7 +60,7 @@ export default function PartyShell({
       if (data.you.isAdmin !== me.isAdmin) {
         onMe({ ...me, isAdmin: data.you.isAdmin, color: data.you.color });
       }
-      setSnap((prev) => {
+      setSnap(() => {
         const last = data.chat[data.chat.length - 1];
         if (last && last.id !== lastChatIdRef.current) {
           if (tabRef.current !== "chat") {
@@ -258,13 +258,27 @@ export default function PartyShell({
             </div>
             <div className="min-h-0 flex-1">
               {tab === "queue" && (
-                <QueuePanel snap={snap} isAdmin={isAdmin} adminKey={adminKey} refresh={refresh} onGoDiscover={() => setTab("search")} />
+                <QueuePanel
+                  snap={snap}
+                  me={me}
+                  isAdmin={isAdmin}
+                  adminKey={adminKey}
+                  refresh={refresh}
+                  onGoDiscover={() => setTab("search")}
+                />
               )}
               {tab === "search" && <SearchPanel me={me} refresh={refresh} />}
               {tab === "chat" && <ChatPanel me={me} chat={snap?.chat ?? []} />}
               {tab === "deck" && (
-                <div className="hidden lg:block">
-                  <QueuePanel snap={snap} isAdmin={isAdmin} adminKey={adminKey} refresh={refresh} onGoDiscover={() => setTab("search")} />
+                <div className="hidden h-full lg:block">
+                  <QueuePanel
+                    snap={snap}
+                    me={me}
+                    isAdmin={isAdmin}
+                    adminKey={adminKey}
+                    refresh={refresh}
+                    onGoDiscover={() => setTab("search")}
+                  />
                 </div>
               )}
             </div>

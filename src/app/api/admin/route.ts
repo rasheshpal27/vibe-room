@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { chatMessages, partyState, queueItems } from "@/db/schema";
-import { eq, ne } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { ensureState, isAdminKey, STATE_ID, systemMessage, wipeParty } from "@/lib/party";
 
 export const dynamic = "force-dynamic";
@@ -33,9 +33,9 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true });
     }
     case "clearQueue": {
-      // remove upcoming songs but keep what is currently playing
-      await db.delete(queueItems).where(ne(queueItems.status, "playing"));
-      await systemMessage("The host cleared the queue");
+      // Remove upcoming queued songs while preserving the currently playing song and played history
+      await db.delete(queueItems).where(eq(queueItems.status, "queued"));
+      await systemMessage("The host cleared upcoming songs in the queue");
       return NextResponse.json({ ok: true });
     }
     case "clearAll": {

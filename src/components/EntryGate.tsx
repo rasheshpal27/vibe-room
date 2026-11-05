@@ -19,12 +19,13 @@ export interface JoinedUser {
   color: string;
 }
 
-type Stage = "password" | "name" | "closed";
+const LS_ADMIN = "vibe_admin_key";
+type Stage = "form" | "closed";
 
 export default function EntryGate({ onJoined }: { onJoined: (u: JoinedUser) => void }) {
-  const [stage, setStage] = useState<Stage>("password");
-  const [password, setPassword] = useState("");
+  const [stage, setStage] = useState<Stage>("form");
   const [name, setName] = useState("");
+  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [shake, setShake] = useState(0);
@@ -35,41 +36,21 @@ export default function EntryGate({ onJoined }: { onJoined: (u: JoinedUser) => v
     setBusy(false);
   };
 
-  const submitPassword = async () => {
-    if (!password.trim() || busy) return;
-    setBusy(true);
-    setError("");
-    try {
-      // The same field accepts the party password OR the host password.
-      // Try party first via a join probe is wasteful — instead we decide at name stage.
-      // But "closed room" detection needs the party password, so probe now with a
-      // throwaway join-free check: attempt admin verify; if that fails we assume
-      // party password and validate at join time.
-      const adminProbe = await fetch("/api/auth", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "admin", password: password.trim() }),
-      }).then((r) => r.json());
-
-      if (adminProbe.ok) {
-        setStage("name");
-        setBusy(false);
-        return;
-      }
-      setStage("name");
-      setBusy(false);
-    } catch {
-      fail("Network hiccup. Try again.");
-    }
-  };
-
-  const submitName = async () => {
+  const submitJoin = async (e?: React.FormEvent) => {
+    e?.preventDefault();
     if (busy) return;
-    const clean = name.trim();
-    if (!clean) {
+    const cleanName = name.trim();
+    const cleanPassword = password.trim();
+
+    if (!cleanName) {
       fail("Tell us your name first.");
       return;
     }
+    if (!cleanPassword) {
+      fail("Enter the party or host password.");
+      return;
+    }
+
     setBusy(true);
     setError("");
     try {
@@ -78,9 +59,9 @@ export default function EntryGate({ onJoined }: { onJoined: (u: JoinedUser) => v
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "join",
-          password: password.trim(),
-          adminPassword: password.trim(), // server picks whichever matches
-          name: clean,
+          password: cleanPassword,
+          adminPassword: cleanPassword, // server picks whichever matches
+          name: cleanName,
         }),
       });
       const data = await res.json();
@@ -93,7 +74,15 @@ export default function EntryGate({ onJoined }: { onJoined: (u: JoinedUser) => v
         fail(data.error ?? "Could not join.");
         return;
       }
-      onJoined(data.user as JoinedUser);
+      const joined = data.user as JoinedUser;
+      if (joined.isAdmin) {
+        try {
+          localStorage.setItem(LS_ADMIN, cleanPassword);
+        } catch {
+          /* ignore storage restrictions */
+        }
+      }
+      onJoined(joined);
     } catch {
       fail("Network hiccup. Try again.");
     }
@@ -132,77 +121,64 @@ export default function EntryGate({ onJoined }: { onJoined: (u: JoinedUser) => v
           key={shake}
           className={`glass-deep rounded-[2rem] p-7 shadow-[0_40px_120px_rgba(0,0,0,0.6)] sm:p-9 ${shake ? "animate-shake" : "animate-pop-in"}`}
         >
-          {stage === "password" && (
-            <div className="animate-fade-up">
-              <p className="mb-6 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.3em] text-violet-300/80">
+          {stage === "form" && (
+            <form onSubmit={submitJoin} className="animate-fade-up space-y-5">
+              <p className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.3em] text-violet-300/80">
                 <LockKeyhole className="h-3.5 w-3.5" />
-                private session
+                private session · step inside
               </p>
-              <label className="mb-2 block font-display text-lg text-zinc-100">
-                Enter the vibe code
-              </label>
-              <input
-                type="password"
-                autoFocus
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && submitPassword()}
-                placeholder="••••••••"
-                className="mt-2 w-full rounded-2xl border border-white/10 bg-black/40 px-5 py-4 text-center font-display text-xl tracking-[0.4em] text-white outline-none transition placeholder:text-zinc-600 focus:border-fuchsia-400/60 focus:shadow-[0_0_30px_rgba(217,70,239,0.25)]"
-              />
-              <p className="mt-3 text-center text-xs text-zinc-500">
-                Party password — or the host password if you run the deck.
-              </p>
-              {error && (
-                <p className="mt-4 rounded-xl border border-rose-400/30 bg-rose-500/10 px-4 py-2.5 text-center text-sm text-rose-200">
-                  {error}
-                </p>
-              )}
-              <button
-                onClick={submitPassword}
-                disabled={busy || !password.trim()}
-                className="group mt-6 flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-violet-500 via-fuchsia-500 to-cyan-400 px-5 py-4 font-display text-sm font-bold uppercase tracking-[0.2em] text-white transition hover:shadow-[0_0_40px_rgba(217,70,239,0.45)] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                {busy ? (
-                  <LoaderCircle className="h-5 w-5 animate-spin" />
-                ) : (
-                  <>
-                    Step inside
-                    <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1" />
-                  </>
-                )}
-              </button>
-            </div>
-          )}
 
-          {stage === "name" && (
-            <div className="animate-fade-up">
-              <p className="mb-6 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.3em] text-cyan-300/80">
-                <UserRound className="h-3.5 w-3.5" />
-                almost in
-              </p>
-              <label className="mb-2 block font-display text-lg text-zinc-100">
-                What do we call you?
-              </label>
-              <input
-                type="text"
-                autoFocus
-                maxLength={24}
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && submitName()}
-                placeholder="your name"
-                className="mt-2 w-full rounded-2xl border border-white/10 bg-black/40 px-5 py-4 text-center font-display text-xl text-white outline-none transition placeholder:text-zinc-600 focus:border-cyan-300/60 focus:shadow-[0_0_30px_rgba(34,211,238,0.2)]"
-              />
+              <div>
+                <label
+                  htmlFor="entry-name"
+                  className="mb-2 flex items-center gap-2 font-display text-sm text-zinc-100"
+                >
+                  <UserRound className="h-4 w-4 text-cyan-300" />
+                  What do we call you?
+                </label>
+                <input
+                  id="entry-name"
+                  type="text"
+                  autoFocus
+                  maxLength={24}
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="your name"
+                  className="w-full rounded-2xl border border-white/10 bg-black/40 px-5 py-3.5 text-center font-display text-lg text-white outline-none transition placeholder:text-zinc-600 focus:border-cyan-300/60 focus:shadow-[0_0_30px_rgba(34,211,238,0.2)]"
+                />
+              </div>
+
+              <div>
+                <label
+                  htmlFor="entry-password"
+                  className="mb-2 flex items-center gap-2 font-display text-sm text-zinc-100"
+                >
+                  <LockKeyhole className="h-4 w-4 text-fuchsia-300" />
+                  Enter the vibe code
+                </label>
+                <input
+                  id="entry-password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full rounded-2xl border border-white/10 bg-black/40 px-5 py-3.5 text-center font-display text-lg tracking-[0.35em] text-white outline-none transition placeholder:text-zinc-600 focus:border-fuchsia-400/60 focus:shadow-[0_0_30px_rgba(217,70,239,0.25)]"
+                />
+                <p className="mt-2 text-center text-xs text-zinc-500">
+                  Party password — or the host password if you run the deck.
+                </p>
+              </div>
+
               {error && (
-                <p className="mt-4 rounded-xl border border-rose-400/30 bg-rose-500/10 px-4 py-2.5 text-center text-sm text-rose-200">
+                <p className="rounded-xl border border-rose-400/30 bg-rose-500/10 px-4 py-2.5 text-center text-sm text-rose-200">
                   {error}
                 </p>
               )}
+
               <button
-                onClick={submitName}
-                disabled={busy || !name.trim()}
-                className="group mt-6 flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-violet-500 via-fuchsia-500 to-cyan-400 px-5 py-4 font-display text-sm font-bold uppercase tracking-[0.2em] text-white transition hover:shadow-[0_0_40px_rgba(34,211,238,0.35)] disabled:cursor-not-allowed disabled:opacity-40"
+                type="submit"
+                disabled={busy || !name.trim() || !password.trim()}
+                className="group flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-violet-500 via-fuchsia-500 to-cyan-400 px-5 py-4 font-display text-sm font-bold uppercase tracking-[0.2em] text-white transition hover:shadow-[0_0_40px_rgba(217,70,239,0.45)] disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {busy ? (
                   <LoaderCircle className="h-5 w-5 animate-spin" />
@@ -213,16 +189,7 @@ export default function EntryGate({ onJoined }: { onJoined: (u: JoinedUser) => v
                   </>
                 )}
               </button>
-              <button
-                onClick={() => {
-                  setStage("password");
-                  setError("");
-                }}
-                className="mt-4 w-full text-center text-xs text-zinc-500 underline-offset-4 transition hover:text-zinc-300 hover:underline"
-              >
-                back
-              </button>
-            </div>
+            </form>
           )}
 
           {stage === "closed" && (
@@ -237,7 +204,7 @@ export default function EntryGate({ onJoined }: { onJoined: (u: JoinedUser) => v
               </p>
               <button
                 onClick={() => {
-                  setStage("password");
+                  setStage("form");
                   setError("");
                 }}
                 className="mt-6 w-full rounded-2xl border border-white/10 bg-white/5 px-5 py-4 font-display text-sm font-bold uppercase tracking-[0.2em] text-white transition hover:bg-white/10"
