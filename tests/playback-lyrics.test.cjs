@@ -109,10 +109,9 @@ test('world clock NTP filter selects lowest-RTT samples and computes exact milli
     computeExpectedPosition,
   } = load('src/lib/clock.ts');
 
-  // True world UTC at performance.now() === 0 is 1_700_000_000_000
-  const s1 = createClockSample(100, 120, 1_700_000_000_110); // RTT 20ms, exact midpoint 110ms -> utcAtMonoZero = 1_700_000_000_000
-  const s2 = createClockSample(200, 224, 1_700_000_000_212); // RTT 24ms, midpoint 212ms -> utcAtMonoZero = 1_700_000_000_000
-  const noisy = createClockSample(300, 650, 1_700_000_000_600); // RTT 350ms outlier -> rejected by filter
+  const s1 = createClockSample(100, 120, 1_700_000_000_110);
+  const s2 = createClockSample(200, 224, 1_700_000_000_212);
+  const noisy = createClockSample(300, 650, 1_700_000_000_600);
 
   const state = selectBestClockAnchor([s1, s2, noisy], 1_700_000_000_500, 500);
   assert.equal(state.synced, true);
@@ -147,15 +146,26 @@ test('song suggestions exclude already queued/playing tracks and fall back to cu
   assert.ok(!res.some((s) => s.videoId === 'vid-1'));
 });
 
-test('UI components implement all 6 requested changes and compile cleanly', () => {
+test('UI components implement 3-column layout, self-healing track transitions, and automatic sound', () => {
   const entryCode = fs.readFileSync('src/components/EntryGate.tsx', 'utf8');
   assert.ok(entryCode.includes('id="entry-name"') && entryCode.includes('id="entry-password"'), 'Name and password on same page');
 
   const nowPlayingCode = fs.readFileSync('src/components/NowPlaying.tsx', 'utf8');
-  assert.ok(nowPlayingCode.includes('useState(true)'), 'Lyrics on by default on home page');
+  assert.ok(!nowPlayingCode.includes('Tap for sound'), 'Sound is automatically on without Tap for sound gate');
+  assert.ok(!nowPlayingCode.includes('swapPlayers'), 'No DOM iframe reparenting on song change');
+  assert.ok(nowPlayingCode.includes('rebuildPlayer'), 'Self-healing player recreation on transition errors');
+
+  const shellCode = fs.readFileSync('src/components/PartyShell.tsx', 'utf8');
+  assert.ok(
+    shellCode.includes('Lyrics column') &&
+    shellCode.includes('Deck column') &&
+    shellCode.includes('Queue and room column') &&
+    shellCode.includes('h-dvh'),
+    'Lyrics, Deck, and Queue are side-by-side in 3 columns with viewport-locked height'
+  );
 
   const lyricsCode = fs.readFileSync('src/components/LyricsOverlay.tsx', 'utf8');
-  assert.ok(!lyricsCode.includes('createPortal') && !lyricsCode.includes('<dialog'), 'Lyrics inline on home page, not a popup modal');
+  assert.ok(!lyricsCode.includes('createPortal') && !lyricsCode.includes('<dialog'), 'Lyrics inline on home page');
 
   const queueCode = fs.readFileSync('src/components/QueuePanel.tsx', 'utf8');
   assert.ok(queueCode.includes('Next playing') && queueCode.includes('Played earlier') && queueCode.includes('Suggested for the Queue'));

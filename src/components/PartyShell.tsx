@@ -17,9 +17,11 @@ import {
   X,
   LoaderCircle,
   SkipForward,
+  MicVocal,
 } from "lucide-react";
 import Aurora from "./Aurora";
 import NowPlaying from "./NowPlaying";
+import LyricsOverlay from "./LyricsOverlay";
 import QueuePanel from "./QueuePanel";
 import SearchPanel from "./SearchPanel";
 import ChatPanel from "./ChatPanel";
@@ -27,7 +29,8 @@ import type { PartySnapshot } from "@/lib/types";
 import type { JoinedUser } from "./EntryGate";
 
 const LS_ADMIN = "vibe_admin_key";
-type Tab = "deck" | "queue" | "search" | "chat";
+type Tab = "lyrics" | "deck" | "queue" | "search" | "chat";
+type RightTab = "queue" | "search" | "chat";
 
 export default function PartyShell({
   me,
@@ -40,12 +43,16 @@ export default function PartyShell({
 }) {
   const [snap, setSnap] = useState<PartySnapshot | null>(null);
   const [tab, setTab] = useState<Tab>("deck");
+  const [rightTab, setRightTab] = useState<RightTab>("queue");
+  const [playheadSec, setPlayheadSec] = useState(0);
   const [adminKey, setAdminKey] = useState("");
   const [hostModal, setHostModal] = useState(false);
   const [unreadChat, setUnreadChat] = useState(0);
   const lastChatIdRef = useRef(0);
   const tabRef = useRef<Tab>("deck");
+  const rightTabRef = useRef<RightTab>("queue");
   tabRef.current = tab;
+  rightTabRef.current = rightTab;
 
   const refresh = useCallback(async () => {
     try {
@@ -53,7 +60,6 @@ export default function PartyShell({
       if (!res.ok) return;
       const data = (await res.json()) as PartySnapshot;
       if (!data.you) {
-        // we were removed (host ended the party)
         onLeft();
         return;
       }
@@ -63,7 +69,7 @@ export default function PartyShell({
       setSnap(() => {
         const last = data.chat[data.chat.length - 1];
         if (last && last.id !== lastChatIdRef.current) {
-          if (tabRef.current !== "chat") {
+          if (tabRef.current !== "chat" && rightTabRef.current !== "chat") {
             const prevMax = lastChatIdRef.current;
             setUnreadChat(data.chat.filter((c) => c.id > prevMax).length);
           }
@@ -88,8 +94,8 @@ export default function PartyShell({
   }, []);
 
   useEffect(() => {
-    if (tab === "chat") setUnreadChat(0);
-  }, [tab]);
+    if (tab === "chat" || rightTab === "chat") setUnreadChat(0);
+  }, [tab, rightTab]);
 
   const isAdmin = !!adminKey;
 
@@ -130,16 +136,21 @@ export default function PartyShell({
     onLeft();
   };
 
+  const goDiscover = useCallback(() => {
+    setTab("search");
+    setRightTab("search");
+  }, []);
+
   const playing = snap?.party.isPlaying && snap?.nowPlaying;
   const queueCount = snap?.queue.length ?? 0;
 
   return (
-    <main className="grain relative flex min-h-dvh flex-col">
+    <main className="grain relative flex h-dvh flex-col overflow-hidden">
       <Aurora live={!!playing} />
 
       {/* ---------- header ---------- */}
-      <header className="sticky top-0 z-40 border-b border-white/5 bg-[#050509]/70 backdrop-blur-xl">
-        <div className="mx-auto flex h-16 max-w-[1500px] items-center gap-4 px-4 sm:px-6">
+      <header className="z-40 shrink-0 border-b border-white/5 bg-[#050509]/70 backdrop-blur-xl">
+        <div className="mx-auto flex h-14 max-w-[1720px] items-center gap-4 px-4 sm:px-6">
           <div className="flex items-center gap-2.5">
             <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-violet-500 via-fuchsia-500 to-cyan-400">
               <AudioLines className="h-4.5 w-4.5 text-white" strokeWidth={2.4} />
@@ -180,13 +191,13 @@ export default function PartyShell({
                 <div
                   key={u.id}
                   title={u.name}
-                  className="flex h-8 w-8 items-center justify-center rounded-full border-2 border-[#0b0b13] text-[11px] font-bold text-black/80"
+                  className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-[#0b0b13] text-[10px] font-bold text-black/80"
                   style={{ backgroundColor: u.color }}
                 >
                   {u.name.slice(0, 1).toUpperCase()}
                 </div>
               ))}
-              <span className="ml-4 text-xs font-medium text-zinc-400">
+              <span className="ml-3.5 text-xs font-medium text-zinc-400">
                 {snap?.users.length ?? 0} in room
               </span>
             </div>
@@ -194,14 +205,14 @@ export default function PartyShell({
             {!isAdmin && (
               <button
                 onClick={() => setHostModal(true)}
-                className="flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-3.5 py-2 text-xs font-semibold text-zinc-300 transition hover:border-amber-300/40 hover:text-amber-200"
+                className="flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-zinc-300 transition hover:border-amber-300/40 hover:text-amber-200"
               >
                 <Crown className="h-3.5 w-3.5" />
                 <span className="hidden sm:inline">Host</span>
               </button>
             )}
             {isAdmin && (
-              <span className="flex items-center gap-1.5 rounded-full border border-amber-300/30 bg-amber-400/10 px-3.5 py-2 text-xs font-bold text-amber-200">
+              <span className="flex items-center gap-1.5 rounded-full border border-amber-300/30 bg-amber-400/10 px-3 py-1.5 text-xs font-bold text-amber-200">
                 <Crown className="h-3.5 w-3.5" />
                 HOST
               </span>
@@ -209,7 +220,7 @@ export default function PartyShell({
             <button
               onClick={leave}
               title="Leave the party"
-              className="flex h-9 w-9 items-center justify-center rounded-full border border-white/10 bg-white/5 text-zinc-400 transition hover:border-rose-400/40 hover:text-rose-300"
+              className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/5 text-zinc-400 transition hover:border-rose-400/40 hover:text-rose-300"
             >
               <LogOut className="h-4 w-4" />
             </button>
@@ -217,69 +228,104 @@ export default function PartyShell({
         </div>
       </header>
 
-      {/* ---------- body ---------- */}
-      <div className="relative z-10 mx-auto grid w-full max-w-[1500px] flex-1 gap-6 px-4 pb-28 pt-6 sm:px-6 lg:grid-cols-[minmax(0,1fr)_460px] lg:pb-10">
-        {/* deck column */}
-        <section className={`${tab === "deck" ? "block" : "hidden"} lg:block`}>
-          <NowPlaying
-            snap={snap}
-            isAdmin={isAdmin}
-            onPlayerAction={playerAction}
-            onGoDiscover={() => setTab("search")}
+      {/* ---------- 3-Column Side-by-Side Body (Lyrics | Deck | Queue) ---------- */}
+      <div className="relative z-10 mx-auto grid min-h-0 w-full max-w-[1720px] flex-1 gap-4 overflow-hidden px-4 pb-20 pt-4 sm:px-6 lg:grid-cols-[minmax(280px,360px)_minmax(340px,1fr)_minmax(320px,420px)] lg:pb-4 xl:grid-cols-[380px_minmax(400px,1fr)_440px]">
+        {/* COLUMN 1: LYRICS (side-by-side on left on desktop, tab on mobile) */}
+        <section
+          aria-label="Lyrics column"
+          className={`${
+            tab === "lyrics" ? "flex" : "hidden"
+          } min-h-0 flex-col overflow-hidden lg:flex`}
+        >
+          <LyricsOverlay
+            key={snap?.nowPlaying?.videoId ?? "idle"}
+            title={snap?.nowPlaying?.title}
+            artist={snap?.nowPlaying?.artist}
+            position={playheadSec}
           />
-          {isAdmin && <AdminDock onAdmin={adminAction} onPlayer={playerAction} />}
         </section>
 
-        {/* side panel */}
-        <aside className={`${tab === "deck" ? "hidden lg:block" : "block"}`}>
-          <div className="glass-deep flex h-full min-h-[60vh] flex-col overflow-hidden rounded-[1.8rem] lg:max-h-[calc(100dvh-7.5rem)] lg:sticky lg:top-24">
+        {/* COLUMN 2: DECK (side-by-side in center on desktop, always mounted so audio never stops) */}
+        <section
+          aria-label="Deck column"
+          className={`${
+            tab === "deck"
+              ? "flex"
+              : "pointer-events-none fixed -left-[9999px] top-0 h-px w-px overflow-hidden opacity-0 lg:pointer-events-auto lg:static lg:h-auto lg:w-auto lg:opacity-100"
+          } min-h-0 flex-col items-center justify-center overflow-y-auto lg:flex lg:overflow-hidden`}
+        >
+          <div className="w-full">
+            <NowPlaying
+              snap={snap}
+              isAdmin={isAdmin}
+              onPlayerAction={playerAction}
+              onGoDiscover={goDiscover}
+              onPositionChange={setPlayheadSec}
+            />
+            {isAdmin && (
+              <AdminDock onAdmin={adminAction} onPlayer={playerAction} />
+            )}
+          </div>
+        </section>
+
+        {/* COLUMN 3: QUEUE / DISCOVER / CHAT (side-by-side on right on desktop) */}
+        <aside
+          aria-label="Queue and room column"
+          className={`${
+            tab === "queue" || tab === "search" || tab === "chat"
+              ? "flex"
+              : "hidden"
+          } min-h-0 flex-col overflow-hidden lg:flex`}
+        >
+          <div className="glass-deep flex h-full min-h-0 flex-col overflow-hidden rounded-[1.8rem]">
             {/* tabs */}
-            <div className="flex items-center gap-1 border-b border-white/5 p-2">
+            <div className="flex shrink-0 items-center gap-1 border-b border-white/5 p-2">
               <SideTab
-                active={tab === "queue"}
-                onClick={() => setTab("queue")}
+                active={rightTab === "queue"}
+                onClick={() => {
+                  setRightTab("queue");
+                  setTab("queue");
+                }}
                 icon={<ListMusic className="h-4 w-4" />}
                 label={`Queue${queueCount ? ` · ${queueCount}` : ""}`}
               />
               <SideTab
-                active={tab === "search"}
-                onClick={() => setTab("search")}
+                active={rightTab === "search"}
+                onClick={() => {
+                  setRightTab("search");
+                  setTab("search");
+                }}
                 icon={<Search className="h-4 w-4" />}
                 label="Discover"
               />
               <SideTab
-                active={tab === "chat"}
-                onClick={() => setTab("chat")}
+                active={rightTab === "chat"}
+                onClick={() => {
+                  setRightTab("chat");
+                  setTab("chat");
+                }}
                 icon={<MessageSquare className="h-4 w-4" />}
                 label="Chat"
                 dot={unreadChat > 0}
                 dotCount={unreadChat}
               />
             </div>
-            <div className="min-h-0 flex-1">
-              {tab === "queue" && (
+            <div className="min-h-0 flex-1 overflow-hidden">
+              {rightTab === "queue" && (
                 <QueuePanel
                   snap={snap}
                   me={me}
                   isAdmin={isAdmin}
                   adminKey={adminKey}
                   refresh={refresh}
-                  onGoDiscover={() => setTab("search")}
+                  onGoDiscover={goDiscover}
                 />
               )}
-              {tab === "search" && <SearchPanel me={me} refresh={refresh} />}
-              {tab === "chat" && <ChatPanel me={me} chat={snap?.chat ?? []} />}
-              {tab === "deck" && (
-                <div className="hidden h-full lg:block">
-                  <QueuePanel
-                    snap={snap}
-                    me={me}
-                    isAdmin={isAdmin}
-                    adminKey={adminKey}
-                    refresh={refresh}
-                    onGoDiscover={() => setTab("search")}
-                  />
-                </div>
+              {rightTab === "search" && (
+                <SearchPanel me={me} refresh={refresh} />
+              )}
+              {rightTab === "chat" && (
+                <ChatPanel me={me} chat={snap?.chat ?? []} />
               )}
             </div>
           </div>
@@ -288,11 +334,50 @@ export default function PartyShell({
 
       {/* ---------- mobile bottom nav ---------- */}
       <nav className="fixed bottom-0 left-0 right-0 z-40 border-t border-white/10 bg-[#08080f]/95 backdrop-blur-xl lg:hidden">
-        <div className="mx-auto grid max-w-md grid-cols-4 gap-1 px-3 pt-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
-          <NavBtn active={tab === "deck"} onClick={() => setTab("deck")} icon={<Disc3 className="h-5 w-5" />} label="Deck" playing={!!playing} />
-          <NavBtn active={tab === "queue"} onClick={() => setTab("queue")} icon={<ListMusic className="h-5 w-5" />} label="Queue" badge={queueCount} />
-          <NavBtn active={tab === "search"} onClick={() => setTab("search")} icon={<Search className="h-5 w-5" />} label="Discover" />
-          <NavBtn active={tab === "chat"} onClick={() => setTab("chat")} icon={<MessageSquare className="h-5 w-5" />} label="Chat" badge={unreadChat} accent />
+        <div className="mx-auto grid max-w-md grid-cols-5 gap-1 px-2 pt-1.5 pb-[max(0.4rem,env(safe-area-inset-bottom))]">
+          <NavBtn
+            active={tab === "lyrics"}
+            onClick={() => setTab("lyrics")}
+            icon={<MicVocal className="h-4.5 w-4.5" />}
+            label="Lyrics"
+          />
+          <NavBtn
+            active={tab === "deck"}
+            onClick={() => setTab("deck")}
+            icon={<Disc3 className="h-4.5 w-4.5" />}
+            label="Deck"
+            playing={!!playing}
+          />
+          <NavBtn
+            active={tab === "queue"}
+            onClick={() => {
+              setTab("queue");
+              setRightTab("queue");
+            }}
+            icon={<ListMusic className="h-4.5 w-4.5" />}
+            label="Queue"
+            badge={queueCount}
+          />
+          <NavBtn
+            active={tab === "search"}
+            onClick={() => {
+              setTab("search");
+              setRightTab("search");
+            }}
+            icon={<Search className="h-4.5 w-4.5" />}
+            label="Discover"
+          />
+          <NavBtn
+            active={tab === "chat"}
+            onClick={() => {
+              setTab("chat");
+              setRightTab("chat");
+            }}
+            icon={<MessageSquare className="h-4.5 w-4.5" />}
+            label="Chat"
+            badge={unreadChat}
+            accent
+          />
         </div>
       </nav>
 
@@ -338,8 +423,10 @@ function SideTab({
   return (
     <button
       onClick={onClick}
-      className={`relative flex flex-1 items-center justify-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold transition ${
-        active ? "bg-white/10 text-white" : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300"
+      className={`relative flex flex-1 items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs font-semibold transition ${
+        active
+          ? "bg-white/10 text-white"
+          : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300"
       }`}
     >
       {icon}
@@ -373,7 +460,7 @@ function NavBtn({
   return (
     <button
       onClick={onClick}
-      className={`relative flex min-h-[48px] flex-col items-center justify-center gap-1 rounded-2xl text-[10px] font-semibold transition active:scale-95 ${
+      className={`relative flex min-h-[44px] flex-col items-center justify-center gap-0.5 rounded-2xl text-[10px] font-semibold transition active:scale-95 ${
         active ? "bg-white/10 text-white" : "text-zinc-500"
       }`}
     >
@@ -381,7 +468,7 @@ function NavBtn({
       {label}
       {!!badge && (
         <span
-          className={`absolute right-2 top-1 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[9px] font-bold text-white ${
+          className={`absolute right-1.5 top-1 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[9px] font-bold text-white ${
             accent ? "bg-fuchsia-500" : "bg-zinc-600"
           }`}
         >
@@ -407,25 +494,38 @@ function AdminDock({
     setBusy(false);
   };
   return (
-    <div className="glass-deep mx-auto mt-6 flex w-fit max-w-full flex-wrap items-center justify-center gap-1.5 rounded-2xl p-2">
-      <span className="mr-1 hidden items-center gap-1.5 px-2 text-[10px] font-bold uppercase tracking-[0.25em] text-amber-200/80 sm:flex">
-        <Crown className="h-3.5 w-3.5" /> deck controls
+    <div className="glass-deep mx-auto mt-3 flex w-fit max-w-full flex-wrap items-center justify-center gap-1.5 rounded-2xl p-1.5">
+      <span className="mr-1 hidden items-center gap-1.5 px-2 text-[10px] font-bold uppercase tracking-[0.22em] text-amber-200/80 xl:flex">
+        <Crown className="h-3.5 w-3.5" /> deck
       </span>
       <DockBtn title="Skip track" onClick={() => run(() => onPlayer("skip"))}>
-        <SkipForward className="h-4 w-4" />
-        <span className="text-xs font-semibold">Skip</span>
+        <SkipForward className="h-3.5 w-3.5" />
+        <span className="text-[11px] font-semibold">Skip</span>
       </DockBtn>
-      <DockBtn title="Clear queue" onClick={() => run(() => onAdmin("clearQueue"))}>
-        <ListX className="h-4 w-4" />
-        <span className="hidden text-xs font-semibold sm:inline">Clear queue</span>
+      <DockBtn
+        title="Clear queue"
+        onClick={() => run(() => onAdmin("clearQueue"))}
+      >
+        <ListX className="h-3.5 w-3.5" />
+        <span className="hidden text-[11px] font-semibold sm:inline">
+          Clear queue
+        </span>
       </DockBtn>
-      <DockBtn title="Clear chat" onClick={() => run(() => onAdmin("clearChat"))}>
-        <MessageSquareOff className="h-4 w-4" />
-        <span className="hidden text-xs font-semibold sm:inline">Clear chat</span>
+      <DockBtn
+        title="Clear chat"
+        onClick={() => run(() => onAdmin("clearChat"))}
+      >
+        <MessageSquareOff className="h-3.5 w-3.5" />
+        <span className="hidden text-[11px] font-semibold sm:inline">
+          Clear chat
+        </span>
       </DockBtn>
-      <DockBtn title="Reset everything (keep room open)" onClick={() => run(() => onAdmin("clearAll"))}>
-        <RotateCcw className="h-4 w-4" />
-        <span className="hidden text-xs font-semibold sm:inline">Reset</span>
+      <DockBtn
+        title="Reset everything (keep room open)"
+        onClick={() => run(() => onAdmin("clearAll"))}
+      >
+        <RotateCcw className="h-3.5 w-3.5" />
+        <span className="hidden text-[11px] font-semibold sm:inline">Reset</span>
       </DockBtn>
       <button
         onClick={() => {
@@ -436,13 +536,17 @@ function AdminDock({
           }
           run(() => onAdmin("endParty"));
         }}
-        className={`flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-bold transition ${
+        className={`flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-[11px] font-bold transition ${
           armEnd
             ? "bg-red-500 text-white shadow-[0_0_24px_rgba(239,68,68,0.5)]"
             : "border border-red-400/30 bg-red-500/10 text-red-300 hover:bg-red-500/20"
         }`}
       >
-        {busy ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Power className="h-4 w-4" />}
+        {busy ? (
+          <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+        ) : (
+          <Power className="h-3.5 w-3.5" />
+        )}
         {armEnd ? "Tap again to END" : "End party"}
       </button>
     </div>
@@ -462,7 +566,7 @@ function DockBtn({
     <button
       title={title}
       onClick={onClick}
-      className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-zinc-300 transition hover:border-violet-400/40 hover:text-white"
+      className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/5 px-2.5 py-1.5 text-zinc-300 transition hover:border-violet-400/40 hover:text-white"
     >
       {children}
     </button>
@@ -471,9 +575,11 @@ function DockBtn({
 
 function ReopenBanner({ onOpen }: { onOpen: () => void }) {
   return (
-    <div className="fixed bottom-24 left-1/2 z-40 -translate-x-1/2 lg:bottom-8">
-      <div className="glass-deep flex items-center gap-4 rounded-2xl px-5 py-3.5">
-        <p className="text-sm text-zinc-300">Room is currently closed to guests.</p>
+    <div className="fixed bottom-24 left-1/2 z-40 -translate-x-1/2 lg:bottom-6">
+      <div className="glass-deep flex items-center gap-4 rounded-2xl px-5 py-3">
+        <p className="text-sm text-zinc-300">
+          Room is currently closed to guests.
+        </p>
         <button
           onClick={onOpen}
           className="rounded-xl bg-gradient-to-r from-violet-500 to-fuchsia-500 px-4 py-2 text-xs font-bold uppercase tracking-widest text-white"
@@ -515,7 +621,6 @@ function HostModal({
         setBusy(false);
         return;
       }
-      // upgrade this session to admin
       const join = await fetch("/api/auth", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -541,8 +646,14 @@ function HostModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm" onClick={onClose}>
-      <div className="glass-deep w-full max-w-sm animate-pop-in rounded-3xl p-7" onClick={(e) => e.stopPropagation()}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="glass-deep w-full max-w-sm animate-pop-in rounded-3xl p-7"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="mb-5 flex items-start justify-between">
           <div>
             <p className="flex items-center gap-2 font-display text-lg text-white">
@@ -552,7 +663,10 @@ function HostModal({
               Control the deck, rearrange the queue, moderate the room.
             </p>
           </div>
-          <button onClick={onClose} className="rounded-full p-1.5 text-zinc-500 hover:bg-white/10 hover:text-white">
+          <button
+            onClick={onClose}
+            className="rounded-full p-1.5 text-zinc-500 hover:bg-white/10 hover:text-white"
+          >
             <X className="h-4 w-4" />
           </button>
         </div>
@@ -571,7 +685,11 @@ function HostModal({
           disabled={busy || !pw.trim()}
           className="mt-5 flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-amber-400 to-orange-500 px-5 py-3.5 font-display text-sm font-bold uppercase tracking-[0.2em] text-black transition hover:shadow-[0_0_30px_rgba(251,191,36,0.35)] disabled:opacity-40"
         >
-          {busy ? <LoaderCircle className="h-5 w-5 animate-spin" /> : "Take the deck"}
+          {busy ? (
+            <LoaderCircle className="h-5 w-5 animate-spin" />
+          ) : (
+            "Take the deck"
+          )}
         </button>
       </div>
     </div>

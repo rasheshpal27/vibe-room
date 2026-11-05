@@ -2,7 +2,7 @@
 
 /* Minimal typings for the YouTube IFrame Player API */
 export interface YTPlayer {
-  loadVideoById(opts: { videoId: string; startSeconds?: number }): void;
+  loadVideoById(opts: string | { videoId: string; startSeconds?: number }): void;
   cueVideoById(videoId: string | { videoId: string; startSeconds?: number }): void;
   playVideo(): void;
   pauseVideo(): void;
@@ -20,6 +20,7 @@ export interface YTPlayer {
 }
 
 export const YT_STATE = {
+  UNSTARTED: -1,
   ENDED: 0,
   PLAYING: 1,
   PAUSED: 2,
@@ -41,7 +42,9 @@ export function loadYouTubeAPI(): Promise<any> {
   if (window.YT?.Player) return Promise.resolve(window.YT);
   if (!loadingPromise) {
     loadingPromise = new Promise((resolve, reject) => {
-      let tag = document.querySelector<HTMLScriptElement>('script[src="https://www.youtube.com/iframe_api"]');
+      let tag = document.querySelector<HTMLScriptElement>(
+        'script[src="https://www.youtube.com/iframe_api"]'
+      );
       const finish = (error?: Error) => {
         clearInterval(poll);
         clearTimeout(timeout);
@@ -51,11 +54,20 @@ export function loadYouTubeAPI(): Promise<any> {
           reject(error);
         } else resolve(window.YT);
       };
-      const onError = () => finish(new Error("Could not download YouTube player API. Try again."));
+      const onError = () =>
+        finish(new Error("Could not download YouTube player API. Try again."));
       const poll = window.setInterval(() => {
         if (window.YT?.Player) finish();
       }, 100);
-      const timeout = window.setTimeout(() => finish(new Error("YouTube API timed out. Check your connection or ad blocker and retry.")), 15000);
+      const timeout = window.setTimeout(
+        () =>
+          finish(
+            new Error(
+              "YouTube API timed out. Check your connection or ad blocker and retry."
+            )
+          ),
+        15000
+      );
       if (!tag) {
         tag = document.createElement("script");
         tag.src = "https://www.youtube.com/iframe_api";
@@ -87,7 +99,8 @@ export function createPlayer(
           reject(new Error("Player creation cancelled."));
           return;
         }
-        // YouTube replaces its target. Keep React's host intact for retries/swaps.
+        // YouTube replaces its target node with an iframe. Keep React's host
+        // container intact so we can cleanly recreate the player without unmounting.
         const target = document.createElement("div");
         el.replaceChildren(target);
         let settled = false;
@@ -96,9 +109,15 @@ export function createPlayer(
           settled = true;
           window.clearTimeout(timeout);
           signal?.removeEventListener("abort", cancel);
-          try { player?.destroy(); } catch { /* already removed */ }
+          try {
+            player?.destroy();
+          } catch {
+            /* already removed */
+          }
           target.remove();
-          reject(new Error("Player creation cancelled or timed out. Please retry."));
+          reject(
+            new Error("Player creation cancelled or timed out. Please retry.")
+          );
         };
         const timeout = window.setTimeout(() => {
           if (!settled) cancel();
@@ -108,9 +127,8 @@ export function createPlayer(
         player = new YT.Player(target, {
           width: "100%",
           height: "100%",
-          host: "https://www.youtube-nocookie.com",
           playerVars: {
-            autoplay: 0,
+            autoplay: 1,
             controls: 0,
             disablekb: 1,
             enablejsapi: 1,
@@ -129,8 +147,10 @@ export function createPlayer(
               handlers.onReady(player);
               resolve(player);
             },
-            onStateChange: (e: { data: number }) => !signal?.aborted && handlers.onStateChange(e.data, player),
-            onError: (e: { data: number }) => !signal?.aborted && handlers.onError?.(e.data, player),
+            onStateChange: (e: { data: number }) =>
+              !signal?.aborted && handlers.onStateChange(e.data, player),
+            onError: (e: { data: number }) =>
+              !signal?.aborted && handlers.onError?.(e.data, player),
           },
         });
       })
