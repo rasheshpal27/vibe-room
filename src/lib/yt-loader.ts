@@ -3,7 +3,7 @@
 /* Minimal typings for the YouTube IFrame Player API */
 export interface YTPlayer {
   loadVideoById(opts: { videoId: string; startSeconds?: number }): void;
-  cueVideoById(videoId: string): void;
+  cueVideoById(videoId: string | { videoId: string; startSeconds?: number }): void;
   playVideo(): void;
   pauseVideo(): void;
   stopVideo(): void;
@@ -36,46 +36,38 @@ declare global {
 
 let loadingPromise: Promise<any> | null = null;
 
-function waitForYT(resolve: (yt: any) => void, reject: (err: Error) => void) {
-  const started = Date.now();
-  const timer = window.setInterval(() => {
-    if (window.YT?.Player) {
-      window.clearInterval(timer);
-      resolve(window.YT);
-      return;
-    }
-    if (Date.now() - started > 8000) {
-      window.clearInterval(timer);
-      reject(new Error("YouTube player API did not load. Check ad blockers or network restrictions."));
-    }
-  }, 100);
-}
-
 export function loadYouTubeAPI(): Promise<any> {
   if (typeof window === "undefined") return Promise.reject(new Error("ssr"));
   if (window.YT?.Player) return Promise.resolve(window.YT);
-
   if (!loadingPromise) {
     loadingPromise = new Promise((resolve, reject) => {
-      const prev = window.onYouTubeIframeAPIReady;
-      window.onYouTubeIframeAPIReady = () => {
-        prev?.();
-        if (window.YT?.Player) resolve(window.YT);
+      let tag = document.querySelector<HTMLScriptElement>('script[src="https://www.youtube.com/iframe_api"]');
+      const finish = (error?: Error) => {
+        clearInterval(poll);
+        clearTimeout(timeout);
+        tag?.removeEventListener("error", onError);
+        if (error) {
+          tag?.remove();
+          reject(error);
+        } else resolve(window.YT);
       };
-
-      if (!document.querySelector('script[src="https://www.youtube.com/iframe_api"]')) {
-        const tag = document.createElement("script");
+      const onError = () => finish(new Error("Could not download YouTube player API. Try again."));
+      const poll = window.setInterval(() => {
+        if (window.YT?.Player) finish();
+      }, 100);
+      const timeout = window.setTimeout(() => finish(new Error("YouTube API timed out. Check your connection or ad blocker and retry.")), 15000);
+      if (!tag) {
+        tag = document.createElement("script");
         tag.src = "https://www.youtube.com/iframe_api";
         tag.async = true;
-        tag.onerror = () => reject(new Error("Could not download YouTube player API."));
+        tag.addEventListener("error", onError);
         document.head.appendChild(tag);
-      }
-
-      // Some browsers/extensions load the API but miss the global callback.
-      waitForYT(resolve, reject);
+      } else tag.addEventListener("error", onError);
+    }).catch((error) => {
+      loadingPromise = null;
+      throw error;
     });
   }
-
   return loadingPromise;
 }
 
@@ -85,17 +77,35 @@ export function createPlayer(
     onReady: (p: YTPlayer) => void;
     onStateChange: (state: number, player?: YTPlayer) => void;
     onError?: (code: number, player?: YTPlayer) => void;
-  }
+  },
+  signal?: AbortSignal
 ): Promise<YTPlayer> {
   return loadYouTubeAPI().then(
     (YT) =>
       new Promise<YTPlayer>((resolve, reject) => {
+        if (signal?.aborted || !el.isConnected) {
+          reject(new Error("Player creation cancelled."));
+          return;
+        }
+        // YouTube replaces its target. Keep React's host intact for retries/swaps.
+        const target = document.createElement("div");
+        el.replaceChildren(target);
         let settled = false;
+        let player: YTPlayer;
+        const cancel = () => {
+          settled = true;
+          window.clearTimeout(timeout);
+          signal?.removeEventListener("abort", cancel);
+          try { player?.destroy(); } catch { /* already removed */ }
+          target.remove();
+          reject(new Error("Player creation cancelled or timed out. Please retry."));
+        };
         const timeout = window.setTimeout(() => {
-          if (!settled) reject(new Error("YouTube player iframe did not become ready."));
-        }, 8000);
+          if (!settled) cancel();
+        }, 15000);
 
-        const player: YTPlayer = new YT.Player(el, {
+        signal?.addEventListener("abort", cancel, { once: true });
+        player = new YT.Player(target, {
           width: "100%",
           height: "100%",
           host: "https://www.youtube-nocookie.com",
@@ -113,13 +123,14 @@ export function createPlayer(
           },
           events: {
             onReady: () => {
+              if (settled) return;
               settled = true;
               window.clearTimeout(timeout);
               handlers.onReady(player);
               resolve(player);
             },
-            onStateChange: (e: { data: number }) => handlers.onStateChange(e.data, player),
-            onError: (e: { data: number }) => handlers.onError?.(e.data, player),
+            onStateChange: (e: { data: number }) => !signal?.aborted && handlers.onStateChange(e.data, player),
+            onError: (e: { data: number }) => !signal?.aborted && handlers.onError?.(e.data, player),
           },
         });
       })

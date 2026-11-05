@@ -15,6 +15,7 @@ import {
   ExternalLink,
   LoaderCircle,
 } from "lucide-react";
+import LyricsOverlay from "./LyricsOverlay";
 import { createPlayer, YT_STATE, type YTPlayer } from "@/lib/yt-loader";
 import { formatDuration, type PartySnapshot } from "@/lib/types";
 
@@ -34,6 +35,9 @@ export default function NowPlaying({
   onPlayerAction: (action: string, extra?: Record<string, unknown>) => Promise<void>;
   onGoDiscover: () => void;
 }) {
+  const [lyricsOpen, setLyricsOpen] = useState(false);
+  const lifecycleRef = useRef(new AbortController());
+  const mutedRef = useRef(false);
   const mountRef = useRef<HTMLDivElement | null>(null);
   const preloadMountRef = useRef<HTMLDivElement | null>(null);
   const playerRef = useRef<YTPlayer | null>(null); // the visible player
@@ -42,7 +46,7 @@ export default function NowPlaying({
   const appliedQidRef = useRef<number | null>(null);
   const offsetRef = useRef(0); // serverClock - localClock (RTT corrected)
   const snapRef = useRef<PartySnapshot | null>(null);
-  snapRef.current = snap;
+  useEffect(() => { snapRef.current = snap; }, [snap]);
 
   const [ready, setReady] = useState(false);
   const [muted, setMuted] = useState(false);
@@ -74,7 +78,8 @@ export default function NowPlaying({
   // keep the latest prop/state available to interval + event callbacks
   useEffect(() => {
     volumeRef.current = volume;
-  }, [volume]);
+    mutedRef.current = muted;
+  }, [volume, muted]);
   useEffect(() => {
     onPlayerActionRef.current = onPlayerAction;
   }, [onPlayerAction]);
@@ -178,11 +183,31 @@ export default function NowPlaying({
     setPlayerProblem(friendly);
   }, []);
 
+  const hasTrack = !!snap?.nowPlaying;
+  useEffect(() => {
+    const controller = new AbortController();
+    lifecycleRef.current = controller;
+    return () => {
+      controller.abort();
+      try { playerRef.current?.destroy(); } catch { /* already removed */ }
+      try { preloadRef.current?.destroy(); } catch { /* already removed */ }
+      playerRef.current = null;
+      preloadRef.current = null;
+      readyRef.current = false;
+      preloadReadyRef.current = false;
+      creatingRef.current = false;
+      preloadCreatingRef.current = false;
+      appliedQidRef.current = null;
+      preloadVideoRef.current = null;
+    };
+  }, [hasTrack]);
+
   /* ---------- hidden player that preloads the next queued track ---------- */
   const ensurePreloadPlayer = useCallback(() => {
     const el = preloadMountRef.current;
     if (!el || preloadRef.current || preloadCreatingRef.current) return;
     preloadCreatingRef.current = true;
+    const signal = lifecycleRef.current.signal;
     createPlayer(el, {
       onReady: (pre) => {
         preloadRef.current = pre;
@@ -196,7 +221,7 @@ export default function NowPlaying({
         if (next && preloadVideoRef.current !== next.videoId) {
           preloadVideoRef.current = next.videoId;
           try {
-            pre.loadVideoById({ videoId: next.videoId });
+            pre.cueVideoById(next.videoId);
           } catch {
             /* ignore */
           }
@@ -204,12 +229,13 @@ export default function NowPlaying({
       },
       onStateChange: handleStateChange,
       onError: handleError,
-    })
+    }, signal)
       .catch(() => {
+        if (signal.aborted) return;
         preloadRef.current = null;
       })
       .finally(() => {
-        preloadCreatingRef.current = false;
+        if (!signal.aborted) preloadCreatingRef.current = false;
       });
   }, [handleStateChange, handleError]);
 
@@ -223,7 +249,7 @@ export default function NowPlaying({
       preloadVideoRef.current = next.videoId;
       try {
         pre.mute();
-        pre.loadVideoById({ videoId: next.videoId });
+        pre.cueVideoById(next.videoId);
       } catch {
         /* ignore */
       }
@@ -258,7 +284,7 @@ export default function NowPlaying({
       preloadVideoRef.current = next.videoId;
       try {
         main.mute();
-        main.loadVideoById({ videoId: next.videoId });
+        main.cueVideoById(next.videoId);
       } catch {
         /* ignore */
       }
@@ -291,7 +317,8 @@ export default function NowPlaying({
             const main = playerRef.current;
             if (main) {
               try {
-                main.unMute();
+                if (soundEnabledRef.current && !mutedRef.current) main.unMute();
+                else main.mute();
                 main.setVolume(volumeRef.current);
                 main.seekTo(expected, true);
                 if (p.isPlaying) main.playVideo();
@@ -301,8 +328,8 @@ export default function NowPlaying({
               }
             }
           } else {
-            player.loadVideoById({ videoId: np.videoId, startSeconds: expected });
-            if (!p.isPlaying) setTimeout(() => player.pauseVideo(), 400);
+            if (p.isPlaying) player.loadVideoById({ videoId: np.videoId, startSeconds: expected });
+            else player.cueVideoById({ videoId: np.videoId, startSeconds: expected });
           }
           pendingSeekRef.current = true;
           return;
@@ -310,9 +337,8 @@ export default function NowPlaying({
 
         const st = player.getPlayerState();
 
-        // play/pause alignment — never attempt autoplay until the user has
-        // unlocked sound, and never seek while buffering.
-        if (p.isPlaying && soundEnabledRef.current) {
+        // Muted autoplay can start before the user unlocks audio.
+        if (p.isPlaying) {
           if (st !== YT_STATE.PLAYING && st !== YT_STATE.BUFFERING) {
             player.playVideo();
           }
@@ -349,9 +375,12 @@ export default function NowPlaying({
     const el = mountRef.current;
     if (!el || playerRef.current || creatingRef.current) return;
     creatingRef.current = true;
+    const signal = lifecycleRef.current.signal;
     createPlayer(el, {
       onReady: (p) => {
         playerRef.current = p;
+        if (!soundEnabledRef.current || mutedRef.current) p.mute();
+        setPlayerProblem("");
         readyRef.current = true;
         p.setVolume(volumeRef.current);
         setReady(true);
@@ -359,13 +388,14 @@ export default function NowPlaying({
       },
       onStateChange: handleStateChange,
       onError: handleError,
-    })
+    }, signal)
       .catch((err) => {
+        if (signal.aborted) return;
         playerRef.current = null;
         setPlayerProblem(err instanceof Error ? err.message : "YouTube player could not start.");
       })
       .finally(() => {
-        creatingRef.current = false;
+        if (!signal.aborted) creatingRef.current = false;
       });
   }, [handleStateChange, handleError, sync]);
 
@@ -379,11 +409,13 @@ export default function NowPlaying({
   // the dead player reference and let the next track re-create it fresh.
   useEffect(() => {
     if (snap?.nowPlaying) return;
-    if (playerRef.current || readyRef.current) {
+    {
       try { playerRef.current?.destroy(); } catch { /* ignore */ }
       playerRef.current = null;
       readyRef.current = false;
       appliedQidRef.current = null;
+      // Reflect teardown of the external iframe in the controls.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setReady(false);
       setLoadedQid(null);
       setSoundEnabled(false);
@@ -455,7 +487,7 @@ export default function NowPlaying({
       p.unMute();
       p.setVolume(volumeRef.current || 80);
       p.seekTo(pos, true);
-      p.playVideo();
+      if (snapRef.current?.party.isPlaying) p.playVideo();
       setMuted(false);
       setSoundEnabled(true);
       soundEnabledRef.current = true;
@@ -472,7 +504,7 @@ export default function NowPlaying({
     if (muted) {
       p.unMute();
       p.setVolume(volumeRef.current);
-      p.playVideo();
+      if (snapRef.current?.party.isPlaying) p.playVideo();
       setMuted(false);
       setSoundEnabled(true);
       soundEnabledRef.current = true;
@@ -492,7 +524,7 @@ export default function NowPlaying({
       setMuted(true);
     } else {
       p.unMute();
-      p.playVideo();
+      if (snapRef.current?.party.isPlaying) p.playVideo();
       setMuted(false);
       setSoundEnabled(true);
       soundEnabledRef.current = true;
@@ -784,6 +816,10 @@ export default function NowPlaying({
         )}
       </div>
 
+      {lyricsOpen && <LyricsOverlay key={np.videoId} title={np.title} artist={np.artist} position={displayPos} onClose={() => setLyricsOpen(false)} />}
+      <div className="mt-4 text-center">
+        <button onClick={() => setLyricsOpen(true)} className="rounded-xl border border-white/15 px-5 py-2 text-sm text-zinc-200 hover:bg-white/10">Lyrics</button>
+      </div>
       {/* controls */}
       <div className="mx-auto mt-5 flex w-full max-w-[560px] items-center justify-center gap-3">
         <div className="glass flex items-center gap-1 rounded-2xl p-1.5">
