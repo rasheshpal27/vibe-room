@@ -29,7 +29,7 @@ import type { PartySnapshot } from "@/lib/types";
 import type { JoinedUser } from "./EntryGate";
 
 const LS_ADMIN = "vibe_admin_key";
-type Tab = "lyrics" | "deck" | "queue" | "search" | "chat";
+type Tab = "lyrics" | "queue" | "search" | "chat";
 type RightTab = "queue" | "search" | "chat";
 
 export default function PartyShell({
@@ -42,14 +42,14 @@ export default function PartyShell({
   onMe: (u: JoinedUser) => void;
 }) {
   const [snap, setSnap] = useState<PartySnapshot | null>(null);
-  const [tab, setTab] = useState<Tab>("deck");
+  const [tab, setTab] = useState<Tab>("lyrics");
   const [rightTab, setRightTab] = useState<RightTab>("queue");
   const [playheadSec, setPlayheadSec] = useState(0);
   const [adminKey, setAdminKey] = useState("");
   const [hostModal, setHostModal] = useState(false);
   const [unreadChat, setUnreadChat] = useState(0);
   const lastChatIdRef = useRef(0);
-  const tabRef = useRef<Tab>("deck");
+  const tabRef = useRef<Tab>("lyrics");
   const rightTabRef = useRef<RightTab>("queue");
   tabRef.current = tab;
   rightTabRef.current = rightTab;
@@ -228,31 +228,17 @@ export default function PartyShell({
         </div>
       </header>
 
-      {/* ---------- 3-Column Side-by-Side Body (Lyrics | Deck | Queue) ---------- */}
-      <div className="relative z-10 mx-auto grid min-h-0 w-full max-w-[1720px] flex-1 gap-4 overflow-hidden px-4 pb-20 pt-4 sm:px-6 lg:grid-cols-[minmax(280px,360px)_minmax(340px,1fr)_minmax(320px,420px)] lg:pb-4 xl:grid-cols-[380px_minmax(400px,1fr)_440px]">
-        {/* COLUMN 1: LYRICS (side-by-side on left on desktop, tab on mobile) */}
+      {/* ---------- Side-by-side body: Lyrics | Deck | Queue ----------
+           Desktop/tablet: three real columns.
+           Phone: the deck stays pinned on top (its iframe must never be
+           hidden or shrunk, or mobile browsers throttle playback) and the
+           bottom bar swaps the panel underneath it. Nothing ever scrolls
+           the page itself — only the inner panels move. */}
+      <div className="relative z-10 mx-auto flex min-h-0 w-full max-w-[1720px] flex-1 flex-col gap-2.5 overflow-hidden px-3 pb-2 pt-2.5 sm:px-5 sm:pt-3.5 md:grid md:grid-cols-[minmax(0,0.92fr)_minmax(0,1.3fr)_minmax(0,1fr)] md:gap-4 md:pb-3 lg:grid-cols-[minmax(250px,340px)_minmax(360px,1fr)_minmax(300px,400px)] xl:grid-cols-[350px_minmax(420px,1fr)_420px]">
+        {/* DECK — always mounted *and* always visible */}
         <section
-          aria-label="Lyrics column"
-          className={`${
-            tab === "lyrics" ? "flex" : "hidden"
-          } min-h-0 flex-col overflow-hidden lg:flex`}
-        >
-          <LyricsOverlay
-            key={snap?.nowPlaying?.videoId ?? "idle"}
-            title={snap?.nowPlaying?.title}
-            artist={snap?.nowPlaying?.artist}
-            position={playheadSec}
-          />
-        </section>
-
-        {/* COLUMN 2: DECK (side-by-side in center on desktop, always mounted so audio never stops) */}
-        <section
-          aria-label="Deck column"
-          className={`${
-            tab === "deck"
-              ? "flex"
-              : "pointer-events-none fixed -left-[9999px] top-0 h-px w-px overflow-hidden opacity-0 lg:pointer-events-auto lg:static lg:h-auto lg:w-auto lg:opacity-100"
-          } min-h-0 flex-col items-center justify-center overflow-y-auto lg:flex lg:overflow-hidden`}
+          aria-label="Deck"
+          className="nice-scroll flex max-h-[62dvh] min-h-0 shrink-0 flex-col items-center justify-center overflow-y-auto md:order-2 md:max-h-none"
         >
           <div className="w-full">
             <NowPlaying
@@ -268,16 +254,30 @@ export default function PartyShell({
           </div>
         </section>
 
-        {/* COLUMN 3: QUEUE / DISCOVER / CHAT (side-by-side on right on desktop) */}
-        <aside
-          aria-label="Queue and room column"
+        {/* LYRICS — left column on wide screens, first panel on phones */}
+        <section
+          aria-label="Lyrics"
           className={`${
-            tab === "queue" || tab === "search" || tab === "chat"
-              ? "flex"
-              : "hidden"
-          } min-h-0 flex-col overflow-hidden lg:flex`}
+            tab === "lyrics" ? "flex" : "hidden"
+          } min-h-0 flex-1 flex-col overflow-hidden md:order-1 md:flex`}
         >
-          <div className="glass-deep flex h-full min-h-0 flex-col overflow-hidden rounded-[1.8rem]">
+          <LyricsOverlay
+            key={snap?.nowPlaying?.videoId ?? "idle"}
+            title={snap?.nowPlaying?.title}
+            artist={snap?.nowPlaying?.artist}
+            durationSec={snap?.nowPlaying?.durationSec}
+            position={playheadSec}
+          />
+        </section>
+
+        {/* QUEUE / DISCOVER / CHAT — right column on wide screens */}
+        <aside
+          aria-label="Queue and room"
+          className={`${
+            tab === "lyrics" ? "hidden" : "flex"
+          } min-h-0 flex-1 flex-col overflow-hidden md:order-3 md:flex`}
+        >
+          <div className="glass-deep flex h-full min-h-0 flex-col overflow-hidden rounded-[1.4rem] sm:rounded-[1.8rem]">
             {/* tabs */}
             <div className="flex shrink-0 items-center gap-1 border-b border-white/5 p-2">
               <SideTab
@@ -321,31 +321,21 @@ export default function PartyShell({
                   onGoDiscover={goDiscover}
                 />
               )}
-              {rightTab === "search" && (
-                <SearchPanel me={me} refresh={refresh} />
-              )}
-              {rightTab === "chat" && (
-                <ChatPanel me={me} chat={snap?.chat ?? []} />
-              )}
+              {rightTab === "search" && <SearchPanel me={me} refresh={refresh} />}
+              {rightTab === "chat" && <ChatPanel me={me} chat={snap?.chat ?? []} />}
             </div>
           </div>
         </aside>
       </div>
 
-      {/* ---------- mobile bottom nav ---------- */}
-      <nav className="fixed bottom-0 left-0 right-0 z-40 border-t border-white/10 bg-[#08080f]/95 backdrop-blur-xl lg:hidden">
-        <div className="mx-auto grid max-w-md grid-cols-5 gap-1 px-2 pt-1.5 pb-[max(0.4rem,env(safe-area-inset-bottom))]">
+      {/* ---------- phone panel switcher (the deck stays visible above) ---------- */}
+      <nav className="z-40 shrink-0 border-t border-white/10 bg-[#08080f]/95 backdrop-blur-xl md:hidden">
+        <div className="mx-auto grid max-w-md grid-cols-4 gap-1 px-2 pt-1.5 pb-[max(0.4rem,env(safe-area-inset-bottom))]">
           <NavBtn
             active={tab === "lyrics"}
             onClick={() => setTab("lyrics")}
             icon={<MicVocal className="h-4.5 w-4.5" />}
             label="Lyrics"
-          />
-          <NavBtn
-            active={tab === "deck"}
-            onClick={() => setTab("deck")}
-            icon={<Disc3 className="h-4.5 w-4.5" />}
-            label="Deck"
             playing={!!playing}
           />
           <NavBtn
@@ -575,7 +565,7 @@ function DockBtn({
 
 function ReopenBanner({ onOpen }: { onOpen: () => void }) {
   return (
-    <div className="fixed bottom-24 left-1/2 z-40 -translate-x-1/2 lg:bottom-6">
+    <div className="fixed bottom-24 left-1/2 z-40 -translate-x-1/2 md:bottom-6">
       <div className="glass-deep flex items-center gap-4 rounded-2xl px-5 py-3">
         <p className="text-sm text-zinc-300">
           Room is currently closed to guests.

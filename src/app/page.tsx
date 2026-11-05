@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import EntryGate, { type JoinedUser } from "@/components/EntryGate";
+import { installAudioUnlockListeners } from "@/lib/audio-unlock";
 import PartyShell from "@/components/PartyShell";
 import Aurora from "@/components/Aurora";
 import { AudioLines } from "lucide-react";
@@ -11,6 +12,12 @@ const LS_USER = "vibe_user_v1";
 export default function Page() {
   const [status, setStatus] = useState<"boot" | "gate" | "party">("boot");
   const [user, setUser] = useState<JoinedUser | null>(null);
+
+  // Installed before anything is clickable so the very first interaction
+  // (even the "Join the party" press) counts as the audio unlock gesture.
+  useEffect(() => {
+    installAudioUnlockListeners();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;

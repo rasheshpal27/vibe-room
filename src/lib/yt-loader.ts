@@ -17,6 +17,13 @@ export interface YTPlayer {
   setVolume(v: number): void;
   getIframe(): HTMLIFrameElement;
   destroy(): void;
+  /** Available once the player has loaded a video. */
+  getVideoData?(): { video_id?: string; title?: string; author?: string };
+  /** Module controls — used to force YouTube's own captions off. */
+  loadModule?(module: string): void;
+  unloadModule?(module: string): void;
+  setOption?(module: string, option: string, value: unknown): void;
+  getOptions?(module?: string): string[] | undefined;
 }
 
 export const YT_STATE = {
@@ -83,14 +90,41 @@ export function loadYouTubeAPI(): Promise<any> {
   return loadingPromise;
 }
 
+/** Force YouTube's own subtitle track off — the room shows its own lyrics. */
+export function disableCaptions(player: YTPlayer | null | undefined) {
+  if (!player) return;
+  try {
+    player.unloadModule?.("captions");
+  } catch {
+    /* module may not be loaded yet */
+  }
+  try {
+    player.unloadModule?.("cc");
+  } catch {
+    /* older module name */
+  }
+  try {
+    player.setOption?.("captions", "track", {});
+  } catch {
+    /* ignore */
+  }
+}
+
+export interface CreatePlayerOptions {
+  /** Start muted so blocked autoplay still starts (and stays in sync). */
+  startMuted?: boolean;
+}
+
 export function createPlayer(
   el: HTMLElement,
   handlers: {
     onReady: (p: YTPlayer) => void;
     onStateChange: (state: number, player?: YTPlayer) => void;
     onError?: (code: number, player?: YTPlayer) => void;
+    onApiChange?: (player: YTPlayer) => void;
   },
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  options: CreatePlayerOptions = {}
 ): Promise<YTPlayer> {
   return loadYouTubeAPI().then(
     (YT) =>
@@ -129,18 +163,22 @@ export function createPlayer(
           height: "100%",
           playerVars: {
             autoplay: 1,
+            // Never show YouTube's own subtitles — the room renders synced lyrics.
+            cc_load_policy: 0,
             controls: 0,
             disablekb: 1,
             enablejsapi: 1,
             fs: 0,
             iv_load_policy: 3,
             modestbranding: 1,
+            mute: options.startMuted ? 1 : 0,
             origin: window.location.origin,
             playsinline: 1,
             rel: 0,
           },
           events: {
             onReady: () => {
+              disableCaptions(player);
               if (settled) return;
               settled = true;
               window.clearTimeout(timeout);
@@ -151,6 +189,11 @@ export function createPlayer(
               !signal?.aborted && handlers.onStateChange(e.data, player),
             onError: (e: { data: number }) =>
               !signal?.aborted && handlers.onError?.(e.data, player),
+            onApiChange: () => {
+              // Modules (captions included) are only addressable from here.
+              disableCaptions(player);
+              if (!signal?.aborted) handlers.onApiChange?.(player);
+            },
           },
         });
       })
