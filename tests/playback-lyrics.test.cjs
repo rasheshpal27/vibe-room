@@ -555,15 +555,18 @@ test('songs overlap: two decks, preload, swap, equal-power fade', () => {
   assert.ok(swap.includes('playerRef.current = incoming') && swap.includes('idlePlayerRef.current = outgoing'),
     'decks swap roles');
   assert.ok(swap.includes('incoming.playVideo()') && swap.includes('runCrossfade(incoming, outgoing'),
-    'the new song is already rolling when the fade starts');
-  assert.ok(!swap.includes('loadVideoById'), 'no reload on the hand-over - that is the gap we removed');
+    'a primed deck just resumes - no reload on the hand-over');
+  assert.ok(swap.includes('loaded === videoId && primed'),
+    'the fast path is only taken when the deck really is primed');
+  assert.ok(swap.includes('incoming.loadVideoById'),
+    'a cold deck (unexpected skip) still takes over, it just loads first');
   assert.ok(swap.includes('setLoadedKey(trackKey)'), 'no "loading track" flash during a mix');
 
   assert.ok(code.includes('crossfadeGains'), 'equal-power ramp');
   assert.ok(code.includes('if (!isFading(p)) p.setVolume'),
     'the sync loop does not fight the fade');
-  assert.ok(code.includes('naturalEnd ? CROSSFADE_MS : QUICK_FADE_MS'),
-    'skips get a short fade instead of a 4 second tail');
+  assert.ok(code.includes('naturalEnd ? CROSSFADE_MS : SKIP_FADE_MS'),
+    'a skip gets its own (shorter but still real) crossfade');
   assert.ok(code.includes('if (fadeRef.current) stopFade(true)'),
     'pausing the room kills the tail');
 });
@@ -576,11 +579,72 @@ test('the room timeline moves early so every guest hears the same overlap', () =
   assert.ok(MIN_CROSSFADE_TRACK_SEC >= 45, 'short clips are never crossfaded');
 
   assert.ok(code.includes('remaining <= PRELOAD_LEAD_SEC'), 'preload is scheduled off the playhead');
-  const arm = code.slice(code.indexOf('remaining <= CROSSFADE_SEC &&'));
-  assert.ok(arm.slice(0, 400).includes('preloadStateRef.current === "ready"'),
-    'the end is only reported early when the next song is really primed');
-  assert.ok(arm.slice(0, 400).includes('!endedReportedRef.current.has(trackKey)'),
+  assert.ok(code.includes('msSinceLoad > 6000 || remaining <= PRELOAD_LEAD_SEC'),
+    'the next song is also primed early so a skip can mix too');
+  assert.ok(code.includes('shouldArmEarlyEnd({'), 'the early switch is a single decision');
+  assert.ok(code.includes('alreadyReported: endedReportedRef.current.has(trackKey)'),
     'reported once per track');
-  assert.ok(code.includes('const canCrossfade') && code.includes('party.durationSec >= MIN_CROSSFADE_TRACK_SEC'),
-    'and only for a real song with something queued behind it');
+  assert.ok(code.includes('effectiveRemainingSec('),
+    'the trigger uses the player clock, not just the metadata duration');
+});
+
+test('the early switch does not depend on the preload (that is what killed the overlap)', () => {
+  const { shouldArmEarlyEnd, CROSSFADE_SEC, MIN_CROSSFADE_TRACK_SEC, effectiveRemainingSec } =
+    load('src/lib/playback.ts');
+  const base = { hasNext: true, isPlaying: true, durationSec: 200, alreadyReported: false };
+
+  assert.ok(shouldArmEarlyEnd({ ...base, remainingSec: CROSSFADE_SEC }),
+    'armed as soon as the overlap window opens');
+  assert.ok(shouldArmEarlyEnd({ ...base, remainingSec: 0.5 }),
+    'still armed if a tick was missed');
+  assert.ok(!shouldArmEarlyEnd({ ...base, remainingSec: CROSSFADE_SEC + 1 }),
+    'not before the window');
+  assert.ok(!shouldArmEarlyEnd({ ...base, remainingSec: 1, hasNext: false }),
+    'nothing to mix into');
+  assert.ok(!shouldArmEarlyEnd({ ...base, remainingSec: 1, isPlaying: false }),
+    'not while the room is paused');
+  assert.ok(!shouldArmEarlyEnd({ ...base, remainingSec: 1, alreadyReported: true }),
+    'once per track');
+  assert.ok(
+    !shouldArmEarlyEnd({ ...base, remainingSec: 1, durationSec: MIN_CROSSFADE_TRACK_SEC - 1 }),
+    'short clips are never cut early'
+  );
+
+  // Ground truth: whichever clock says the sound stops sooner.
+  assert.equal(effectiveRemainingSec(40, 3), 3, 'a video shorter than its metadata still mixes');
+  assert.equal(effectiveRemainingSec(3, 40), 3);
+  assert.equal(effectiveRemainingSec(Infinity, 7), 7);
+  assert.equal(effectiveRemainingSec(5, null), 5);
+  assert.equal(effectiveRemainingSec(Infinity, null), Infinity);
+
+  const code = fs.readFileSync('src/components/NowPlaying.tsx', 'utf8');
+  const arm = code.slice(code.indexOf('shouldArmEarlyEnd({'), code.indexOf('shouldArmEarlyEnd({') + 500);
+  assert.ok(!arm.includes('preloadStateRef'),
+    'the early switch must never wait on the preload - the outgoing tail is what covers the gap');
+});
+
+test('the outgoing song covers the gap when the incoming deck is cold', () => {
+  const code = fs.readFileSync('src/components/NowPlaying.tsx', 'utf8');
+  const { FADE_HOLD_MAX_MS, SKIP_FADE_MS } = load('src/lib/playback.ts');
+  assert.ok(FADE_HOLD_MAX_MS >= 1000 && FADE_HOLD_MAX_MS <= 3000);
+  assert.ok(SKIP_FADE_MS >= 1500, 'a skip is a real crossfade now, not a 900ms wipe');
+
+  assert.ok(code.includes('if (!f.startedAt)'), 'the ramp waits before it starts');
+  assert.ok(code.includes("f.incoming?.getPlayerState() === YT_STATE.PLAYING"),
+    'it waits for the new song to be audibly rolling');
+  assert.ok(code.includes('now - f.createdAt < FADE_HOLD_MAX_MS'), 'with a hard cap');
+  const hold = code.slice(code.indexOf('if (!rolling && now - f.createdAt'));
+  assert.ok(hold.slice(0, 400).includes('f.outgoing?.setVolume(roomVolume)'),
+    'and holds the old song at FULL volume until then');
+
+  assert.ok(code.includes('Math.min(wanted, Math.round(outgoingRemaining * 1000))'),
+    'the fade never outlasts the audio the outgoing deck has left');
+  assert.ok(code.includes('naturalEnd ? CROSSFADE_MS : SKIP_FADE_MS'),
+    'skips crossfade too');
+  const boot = code.slice(code.indexOf('The second deck is kept alive'), code.indexOf('The second deck is kept alive') + 500);
+  assert.ok(boot.includes('!idlePlayerRef.current') && boot.includes('mountIdleDeck()'),
+    'the second deck exists at all times so a skip is never cold-started from nothing');
+  assert.ok(code.includes('preloadStateRef.current = "ready"') &&
+    code.includes('idleVideo === preloadedVideoRef.current'),
+    'preload readiness is polled, not only event driven');
 });
