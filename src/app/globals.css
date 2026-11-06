@@ -116,6 +116,32 @@ button, a, [role="button"] {
 .eq-bar { transform-origin: bottom; animation: eq 1.05s ease-in-out infinite; }
 .eq-paused .eq-bar { animation-play-state: paused; transform: scaleY(0.15); }
 
+/* Row action cluster (queue / history rows).
+   The side columns are narrow, and a permanently reserved button strip used to
+   squeeze the song title down to a couple of characters. On a pointer device
+   the cluster floats over the right edge of its row and only appears on hover
+   or keyboard focus, so the title always gets the full width of the row. */
+@media (min-width: 768px) and (hover: hover) {
+  .row-actions {
+    position: absolute;
+    right: 0.5rem;
+    top: 50%;
+    transform: translateY(-50%);
+    opacity: 0;
+    border-radius: 0.85rem;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(10, 10, 18, 0.92);
+    padding: 0.125rem 0.25rem;
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(6px);
+    transition: opacity 0.15s ease;
+  }
+  .group:hover > .row-actions,
+  .row-actions:focus-within {
+    opacity: 1;
+  }
+}
+
 /* vinyl record */
 .vinyl {
   background:
