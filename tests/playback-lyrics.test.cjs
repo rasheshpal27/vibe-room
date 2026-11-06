@@ -292,7 +292,7 @@ test('UI keeps lyrics, deck and queue side by side with automatic sound and self
   assert.ok(lyricsCode.includes('duration'), 'Duration is sent so the matcher can pick the right version');
 
   const queueCode = fs.readFileSync('src/components/QueuePanel.tsx', 'utf8');
-  assert.ok(queueCode.includes('Next playing') && queueCode.includes('Played earlier') && queueCode.includes('Suggested for the Queue'));
+  assert.ok(queueCode.includes('Plays next') && queueCode.includes('Played earlier') && queueCode.includes('Suggested for the Queue'));
 
   const playerRoute = fs.readFileSync('src/app/api/player/route.ts', 'utf8');
   assert.ok(playerRoute.includes('"unplayable"'), 'Server can skip a video nobody can embed');
@@ -647,4 +647,60 @@ test('the outgoing song covers the gap when the incoming deck is cold', () => {
   assert.ok(code.includes('preloadStateRef.current = "ready"') &&
     code.includes('idleVideo === preloadedVideoRef.current'),
     'preload readiness is polled, not only event driven');
+});
+
+/* ------------------------------------------------------------------ *
+ * Round 5: the queue must not dress up the next song as if it were
+ * already playing, and the song title must never be squeezed out of
+ * its row by a badge or by the admin buttons.
+ * ------------------------------------------------------------------ */
+
+test('queue rows: only the playing track gets playback animation', () => {
+  const code = fs.readFileSync('src/components/QueuePanel.tsx', 'utf8');
+
+  const upNext = code.slice(code.indexOf('3. UP NEXT QUEUE'));
+  assert.ok(upNext.length > 500, 'found the Up Next section');
+  assert.ok(!upNext.includes('eq-bar'),
+    'no equalizer bars on a queued song - that is the "now playing" language');
+  assert.ok(!upNext.includes('animate-pulse'),
+    'nothing pulses in the queue, a queued song is not live');
+  assert.ok(upNext.includes('Up next') && upNext.includes('Plays next'),
+    'the first queued row still says it plays next');
+
+  // The real player keeps its equalizer.
+  const nowPlaying = code.slice(
+    code.indexOf('2. ACTIVE ANCHOR'),
+    code.indexOf('3. UP NEXT QUEUE'),
+  );
+  assert.ok(nowPlaying.includes('eq-bar'),
+    'the currently playing row keeps the equalizer');
+});
+
+test('queue rows: the song title owns the full width of its row', () => {
+  const code = fs.readFileSync('src/components/QueuePanel.tsx', 'utf8');
+
+  // A shrink-0 pill inline with a truncated title starves the title.
+  assert.ok(!/shrink-0[^"]*rounded-full[^"]*uppercase/.test(code),
+    'no shrink-0 badge sharing a line with a title');
+  assert.ok(!code.includes('truncate text-[13px] font-semibold'),
+    'titles are clamped over two lines instead of a single truncated line');
+
+  for (const marker of ['{q.title}', '{nowPlaying.title}', '{h.title}']) {
+    const at = code.indexOf(marker);
+    assert.ok(at > 0, `renders ${marker}`);
+    const around = code.slice(at - 320, at);
+    assert.ok(around.includes('line-clamp-2'), `${marker} can wrap to two lines`);
+    assert.ok(around.includes('title='), `${marker} exposes the full name on hover`);
+  }
+
+  // Admin buttons float over the row on wide screens instead of reserving
+  // width next to the title, and drop to their own line on a phone.
+  assert.ok(code.includes('row-actions'), 'action clusters use the floating helper');
+  assert.ok(!code.includes('lg:opacity-0 lg:transition lg:group-hover:opacity-100'),
+    'the old invisible-but-space-consuming button strip is gone');
+  const css = fs.readFileSync('src/app/globals.css', 'utf8');
+  assert.ok(/\.row-actions\s*\{[^}]*position:\s*absolute/.test(css),
+    'row-actions is taken out of flow on pointer devices');
+  assert.ok(css.includes('(hover: hover)'),
+    'touch screens keep the buttons visible in flow');
 });

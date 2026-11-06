@@ -126,6 +126,35 @@ would drift out of sync. When another tab is up it keeps its full size behind it
 `absolute inset-0 opacity-0 pointer-events-none`; on `md` and up those classes are dropped and
 it is simply the middle column again.
 
+## Queue rows — only one song ever looks live
+
+Two things made the queue misleading:
+
+**The next song looked like it was already playing.** Queue slot #1 carried the same visual
+language as the deck — an animated `eq-bar` equalizer burned into its thumbnail, a pulsing
+`SkipForward` icon in the number column, and a glowing gradient card. At a glance two rows
+appeared to be playing at once. The equalizer and every `animate-pulse` are now gone from the
+Up Next list; the row keeps a quiet fuchsia tint, a fuchsia `01`, a static **Up next** chip on
+the artwork and a **Plays next** pill. Animation is reserved for the one row that really is
+playing, so `eq-bar` now appears exactly once in the panel (Now Playing) — a test enforces that.
+
+**The song name disappeared.** The title sat in a `flex items-center gap-1.5` next to a
+`shrink-0` badge, so in a 420px column the pill took its width first and the `truncate`d title
+was left with a few characters. Three changes give the name the whole row:
+
+| Before | After |
+| --- | --- |
+| `shrink-0` badge inline with the title | badge on its own line *above* the title |
+| single `truncate` line | `line-clamp-2` with `title={...}` for the full name on hover |
+| duration in its own column, admin buttons reserving ~120px even while invisible (`lg:opacity-0`) | duration folded into the meta line; buttons use `.row-actions` |
+
+`.row-actions` (in `globals.css`) takes the admin cluster out of flow under
+`@media (min-width: 768px) and (hover: hover)` — it floats over the right edge of the row on
+hover or keyboard focus, so it costs the title zero width. Touch devices and screens below
+`md` never match that query and keep the buttons in flow, where `w-full shrink-0 sm:w-auto`
+drops them onto their own line on a phone. Thumbnails went 84px → 76px as well. Net effect in
+the narrowest column: the title went from roughly 90px of space to the full row width.
+
 ## Lyrics panel
 
 No card, no border, no backdrop: the words sit straight on the room's aurora

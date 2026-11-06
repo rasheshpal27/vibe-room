@@ -270,16 +270,16 @@ export default function QueuePanel({
               return (
                 <div
                   key={`played-${h.id}`}
-                  className="group relative flex items-center gap-3 rounded-2xl border border-white/5 bg-white/[0.02] p-2 opacity-75 transition hover:border-white/10 hover:bg-white/5 hover:opacity-100"
+                  className="group relative flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-2xl border border-white/5 bg-white/[0.02] p-2 opacity-75 transition hover:border-white/10 hover:bg-white/5 hover:opacity-100"
                 >
                   <span
-                    className="flex w-6 items-center justify-center text-[10px] font-bold text-zinc-600"
+                    className="flex w-5 shrink-0 items-center justify-center text-[10px] font-bold text-zinc-600"
                     title={`Played #${idx + 1}`}
                   >
                     <History className="h-3.5 w-3.5" />
                   </span>
 
-                  <div className="relative h-11 w-[76px] shrink-0 overflow-hidden rounded-lg">
+                  <div className="relative h-11 w-[68px] shrink-0 overflow-hidden rounded-lg">
                     {h.thumbnail ? (
                       <img
                         src={h.thumbnail}
@@ -297,20 +297,22 @@ export default function QueuePanel({
                     </span>
                   </div>
 
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-xs font-semibold text-zinc-300">
+                  <div className="min-w-0 flex-1 basis-[7rem]">
+                    <p
+                      className="line-clamp-2 text-xs font-semibold leading-snug text-zinc-300"
+                      title={h.title}
+                    >
                       {h.title}
                     </p>
-                    <p className="truncate text-[10px] text-zinc-500">
-                      {h.artist ? `${h.artist} · ` : ""}by {h.addedByName}
+                    <p className="mt-0.5 truncate text-[10px] text-zinc-500">
+                      <span className="tabular-nums">
+                        {formatDuration(h.durationSec)}
+                      </span>
+                      {h.artist ? ` · ${h.artist}` : ""} · by {h.addedByName}
                     </p>
                   </div>
 
-                  <span className="shrink-0 text-[10px] font-semibold tabular-nums text-zinc-600">
-                    {formatDuration(h.durationSec)}
-                  </span>
-
-                  <div className="flex shrink-0 items-center gap-1">
+                  <div className="row-actions flex w-full shrink-0 items-center justify-end gap-1 sm:w-auto">
                     {me && (
                       <IconBtn
                         title={isReadded ? "Added back to queue" : "Queue again"}
@@ -355,13 +357,13 @@ export default function QueuePanel({
             </div>
             <div className="flex items-center gap-3 rounded-2xl border border-cyan-400/30 bg-gradient-to-r from-cyan-500/15 via-violet-500/10 to-transparent p-2.5">
               <span
-                className="flex w-6 items-center justify-center text-cyan-300"
+                className="flex w-5 shrink-0 items-center justify-center text-cyan-300"
                 title="Currently playing"
               >
                 <AudioLines className="h-4 w-4 animate-pulse" />
               </span>
 
-              <div className="relative h-12 w-[84px] shrink-0 overflow-hidden rounded-lg">
+              <div className="relative h-12 w-[76px] shrink-0 overflow-hidden rounded-lg">
                 {nowPlaying.thumbnail ? (
                   <img
                     src={nowPlaying.thumbnail}
@@ -387,24 +389,28 @@ export default function QueuePanel({
                 </div>
               </div>
 
+              {/* The badge sits on its own line above the title: inline it
+                  would steal the width of this narrow row and leave the song
+                  name truncated to a few characters. */}
               <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-1.5">
-                  <span className="shrink-0 rounded-full border border-cyan-400/40 bg-cyan-400/15 px-2 py-0.5 text-[8px] font-bold uppercase tracking-wider text-cyan-200">
-                    Playing
-                  </span>
-                  <p className="truncate text-[13px] font-semibold text-white">
-                    {nowPlaying.title}
-                  </p>
-                </div>
+                <span className="inline-flex items-center gap-1 rounded-full border border-cyan-400/40 bg-cyan-400/15 px-2 py-0.5 text-[8px] font-bold uppercase tracking-wider text-cyan-200">
+                  <AudioLines className="h-2.5 w-2.5" />
+                  Playing now
+                </span>
+                <p
+                  className="mt-1 line-clamp-2 text-[13px] font-semibold leading-snug text-white"
+                  title={nowPlaying.title}
+                >
+                  {nowPlaying.title}
+                </p>
                 <p className="mt-0.5 truncate text-[11px] text-zinc-400">
-                  {nowPlaying.artist ? `${nowPlaying.artist} · ` : ""}by{" "}
+                  <span className="tabular-nums text-cyan-200/80">
+                    {formatDuration(nowPlaying.durationSec)}
+                  </span>
+                  {nowPlaying.artist ? ` · ${nowPlaying.artist}` : ""} · by{" "}
                   {nowPlaying.addedByName}
                 </p>
               </div>
-
-              <span className="shrink-0 text-[10px] font-semibold tabular-nums text-cyan-200/80">
-                {formatDuration(nowPlaying.durationSec)}
-              </span>
             </div>
           </div>
         )}
@@ -424,28 +430,24 @@ export default function QueuePanel({
               return (
                 <div
                   key={q.id}
-                  className={`group relative flex items-center gap-3 rounded-2xl p-2.5 transition ${
+                  className={`group relative flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-2xl p-2.5 transition ${
                     isNextPlaying
-                      ? "border border-fuchsia-400/35 bg-gradient-to-r from-fuchsia-500/15 via-violet-500/10 to-transparent shadow-[0_0_24px_rgba(217,70,239,0.12)]"
+                      ? "border border-fuchsia-400/30 bg-fuchsia-500/[0.07]"
                       : "border border-transparent hover:bg-white/5"
                   } ${busyId === q.id ? "opacity-50" : ""}`}
                 >
-                  {/* Icon showing that the first queued track is the NEXT song playing */}
-                  {isNextPlaying ? (
-                    <span
-                      className="flex w-6 items-center justify-center text-fuchsia-300"
-                      title="Next song playing"
-                      aria-label="Next song playing"
-                    >
-                      <SkipForward className="h-4 w-4 animate-pulse" />
-                    </span>
-                  ) : (
-                    <span className="w-6 text-center font-display text-xs font-bold text-zinc-600">
-                      {String(i + 1).padStart(2, "0")}
-                    </span>
-                  )}
+                  {/* Queue position. The first row is only tinted, never
+                      animated: an equalizer here read as "this is playing". */}
+                  <span
+                    className={`w-5 shrink-0 text-center font-display text-xs font-bold tabular-nums ${
+                      isNextPlaying ? "text-fuchsia-300" : "text-zinc-600"
+                    }`}
+                    title={isNextPlaying ? "Plays next" : `Queue position ${i + 1}`}
+                  >
+                    {String(i + 1).padStart(2, "0")}
+                  </span>
 
-                  <div className="relative h-12 w-[84px] shrink-0 overflow-hidden rounded-lg">
+                  <div className="relative h-12 w-[76px] shrink-0 overflow-hidden rounded-lg">
                     {q.thumbnail ? (
                       <img
                         src={q.thumbnail}
@@ -459,52 +461,40 @@ export default function QueuePanel({
                       </div>
                     )}
                     {isNextPlaying && (
-                      <div
-                        className="absolute inset-0 flex items-center justify-center bg-black/50"
-                        title="Next song playing"
-                      >
-                        <div className="flex items-center gap-1 rounded-full border border-fuchsia-300/50 bg-fuchsia-500/30 px-2 py-0.5 backdrop-blur-xs">
-                          <SkipForward className="h-3 w-3 text-fuchsia-200" />
-                          <div className="flex h-2.5 items-end gap-[1.5px]">
-                            {[0.8, 1.1, 0.7].map((d, k) => (
-                              <span
-                                key={k}
-                                className="eq-bar w-[2px] rounded-full bg-fuchsia-200"
-                                style={{
-                                  height: "100%",
-                                  animationDuration: `${d}s`,
-                                }}
-                              />
-                            ))}
-                          </div>
-                        </div>
-                      </div>
+                      <span className="absolute bottom-1 left-1 rounded bg-fuchsia-500/85 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-white">
+                        Up next
+                      </span>
                     )}
                   </div>
 
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5">
-                      {isNextPlaying && (
-                        <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-fuchsia-400/40 bg-fuchsia-500/20 px-2 py-0.5 text-[8px] font-bold uppercase tracking-wider text-fuchsia-200">
-                          <SkipForward className="h-2.5 w-2.5" />
-                          Next playing
-                        </span>
-                      )}
-                      <p className="truncate text-[13px] font-semibold text-zinc-100">
-                        {q.title}
-                      </p>
-                    </div>
+                  {/* The badge gets its own line above the title. Inline, a
+                      shrink-0 pill eats this narrow row and the song name is
+                      truncated away to nothing. */}
+                  <div className="min-w-0 flex-1 basis-[7rem]">
+                    {isNextPlaying && (
+                      <span className="inline-flex items-center gap-1 rounded-full border border-fuchsia-400/40 bg-fuchsia-500/20 px-2 py-0.5 text-[8px] font-bold uppercase tracking-wider text-fuchsia-200">
+                        <SkipForward className="h-2.5 w-2.5" />
+                        Plays next
+                      </span>
+                    )}
+                    <p
+                      className={`line-clamp-2 text-[13px] font-semibold leading-snug text-zinc-100 ${
+                        isNextPlaying ? "mt-1" : ""
+                      }`}
+                      title={q.title}
+                    >
+                      {q.title}
+                    </p>
                     <p className="mt-0.5 truncate text-[11px] text-zinc-500">
-                      {q.artist ? `${q.artist} · ` : ""}by {q.addedByName}
+                      <span className="tabular-nums">
+                        {formatDuration(q.durationSec)}
+                      </span>
+                      {q.artist ? ` · ${q.artist}` : ""} · by {q.addedByName}
                     </p>
                   </div>
 
-                  <span className="shrink-0 text-[10px] font-semibold tabular-nums text-zinc-600">
-                    {formatDuration(q.durationSec)}
-                  </span>
-
                   {isAdmin && (
-                    <div className="flex shrink-0 items-center gap-0.5 opacity-100 lg:opacity-0 lg:transition lg:group-hover:opacity-100">
+                    <div className="row-actions flex w-full shrink-0 items-center justify-end gap-0.5 sm:w-auto">
                       <IconBtn
                         title="Play now"
                         onClick={() => playNow(q.id)}
@@ -605,10 +595,13 @@ export default function QueuePanel({
                   </div>
 
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-xs font-semibold text-zinc-100">
+                    <p
+                      className="line-clamp-2 text-xs font-semibold leading-snug text-zinc-100"
+                      title={song.title}
+                    >
                       {song.title}
                     </p>
-                    <p className="truncate text-[10px] text-zinc-400">
+                    <p className="mt-0.5 truncate text-[10px] text-zinc-400">
                       {song.artist} · {formatDuration(song.durationSec)}
                     </p>
                   </div>
