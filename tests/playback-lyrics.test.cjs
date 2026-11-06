@@ -335,7 +335,7 @@ test('simultaneous "ended" reports can only advance the queue once', () => {
 
   const playerRoute = fs.readFileSync('src/app/api/player/route.ts', 'utf8');
   const ended = playerRoute.slice(playerRoute.indexOf('action === "ended"'));
-  assert.ok(ended.slice(0, 400).includes('advanceQueue(qid)'),
+  assert.ok(ended.slice(0, 1200).includes('advanceQueue(qid)'),
     'the ended handler forwards the queue id it saw');
 });
 
@@ -454,4 +454,133 @@ test('the lyrics panel is transparent, wide and readable', () => {
   assert.ok(code.includes('px-1 sm:px-2'), 'margins give the text the full column width');
   assert.ok(code.includes('text-2xl') && code.includes('lg:text-3xl'), 'the active line is large');
   assert.ok(code.includes('text-lg') && code.includes('lg:text-xl'), 'surrounding lines are readable too');
+});
+
+/* ------------------------------------------------------------------ *
+ * Round 3: crossfade between songs, and no replaying the first seconds
+ * of a finished track while the room catches up.
+ * ------------------------------------------------------------------ */
+
+test('crossfade gains hold constant power across the overlap', () => {
+  const { crossfadeGains } = load('src/lib/playback.ts');
+  const start = crossfadeGains(0);
+  assert.equal(Math.round(start.incoming * 1000), 0);
+  assert.equal(Math.round(start.outgoing * 1000), 1000);
+  const end = crossfadeGains(1);
+  assert.equal(Math.round(end.incoming * 1000), 1000);
+  assert.equal(Math.round(end.outgoing * 1000), 0);
+  for (const t of [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1]) {
+    const g = crossfadeGains(t);
+    const power = g.incoming * g.incoming + g.outgoing * g.outgoing;
+    assert.ok(Math.abs(power - 1) < 1e-9, `no volume dip at ${t}`);
+  }
+  // Out of range input is clamped, never NaN or negative volume.
+  assert.deepEqual(crossfadeGains(-5), crossfadeGains(0));
+  assert.deepEqual(crossfadeGains(9), crossfadeGains(1));
+});
+
+test('the server accepts a crossfade-early end report but not an absurd one', () => {
+  const { shouldAcceptEndReport, CROSSFADE_SEC } = load('src/lib/playback.ts');
+  const song = { stateDurationSec: 200 };
+
+  assert.ok(shouldAcceptEndReport({ ...song, elapsedSec: 200 }), 'natural end');
+  assert.ok(
+    shouldAcceptEndReport({ ...song, elapsedSec: 200 - CROSSFADE_SEC }),
+    'the early report that opens the crossfade'
+  );
+  assert.ok(
+    shouldAcceptEndReport({ ...song, elapsedSec: 200 - CROSSFADE_SEC - 3 }),
+    'slack for poll latency'
+  );
+  assert.ok(!shouldAcceptEndReport({ ...song, elapsedSec: 120 }),
+    'a stale or confused client cannot cut the song in half');
+  assert.ok(!shouldAcceptEndReport({ ...song, elapsedSec: 0 }),
+    'and certainly not at the very start');
+
+  // Metadata lied and the video is really 3 minutes: the player's own
+  // duration wins, otherwise the room would stall until the watchdog.
+  assert.ok(
+    shouldAcceptEndReport({ ...song, elapsedSec: 180, clientDurationSec: 180 }),
+    'short real video still advances immediately'
+  );
+  assert.ok(
+    shouldAcceptEndReport({ ...song, elapsedSec: 100, clientDurationSec: 105 }),
+    'the measured length wins over bad metadata'
+  );
+  assert.ok(
+    !shouldAcceptEndReport({ ...song, elapsedSec: 100, clientDurationSec: 3 }),
+    'an implausible client duration is ignored, the stored one still guards'
+  );
+  assert.ok(shouldAcceptEndReport({ elapsedSec: 5, stateDurationSec: 0 }),
+    'unknown length: trust the client');
+
+  const route = fs.readFileSync('src/app/api/player/route.ts', 'utf8');
+  assert.ok(route.includes('shouldAcceptEndReport'), 'the route applies the guard');
+  assert.ok(route.includes('clientDurationSec'), 'and passes the measured duration');
+});
+
+test('a finished video is never restarted while the room catches up', () => {
+  const code = fs.readFileSync('src/components/NowPlaying.tsx', 'utf8');
+  assert.ok(code.includes('if (st === YT_STATE.ENDED) endedHoldRef.current = trackKey'),
+    'reaching the end latches a hold');
+  assert.ok(code.includes('if (party.isPlaying && !endedHold)'),
+    'no play() nudge during the hold - that is what replayed the first seconds');
+  assert.ok(/!endedHold &&\s*shouldHealStall/.test(code),
+    'and no iframe rebuild either');
+  assert.ok(code.includes('expected < party.durationSec - 5'),
+    'scrubbing back into the track releases the hold');
+  const ended = code.slice(code.indexOf('if (state === YT_STATE.ENDED)'));
+  assert.ok(ended.slice(0, 600).includes('endedHoldRef.current = key'),
+    'the ENDED event latches the hold too');
+});
+
+test('songs overlap: two decks, preload, swap, equal-power fade', () => {
+  const code = fs.readFileSync('src/components/NowPlaying.tsx', 'utf8');
+  assert.ok(code.includes('hostARef') && code.includes('hostBRef'),
+    'two persistent player hosts');
+  assert.ok(code.includes('idlePlayerRef'), 'one deck is always free to preload');
+
+  // Preload primes the decoder instead of just cueing (cue does not fetch).
+  const preload = code.slice(
+    code.indexOf('const preloadNext'),
+    code.indexOf('const rebuildPlayer = useCallback')
+  );
+  assert.ok(preload.includes('loadVideoById') && preload.includes('p.mute()'),
+    'the next song is buffered silently');
+  assert.ok(code.includes('preloadStateRef.current = "ready"') && code.includes('target.pauseVideo()'),
+    'and parked back at 0, ready to resume instantly');
+
+  // The swap hands the room over without tearing the audio down.
+  const swap = code.slice(code.indexOf('const swapToIdleDeck'), code.indexOf('/* ---------- load a track onto the live player'));
+  assert.ok(swap.includes('playerRef.current = incoming') && swap.includes('idlePlayerRef.current = outgoing'),
+    'decks swap roles');
+  assert.ok(swap.includes('incoming.playVideo()') && swap.includes('runCrossfade(incoming, outgoing'),
+    'the new song is already rolling when the fade starts');
+  assert.ok(!swap.includes('loadVideoById'), 'no reload on the hand-over - that is the gap we removed');
+  assert.ok(swap.includes('setLoadedKey(trackKey)'), 'no "loading track" flash during a mix');
+
+  assert.ok(code.includes('crossfadeGains'), 'equal-power ramp');
+  assert.ok(code.includes('if (!isFading(p)) p.setVolume'),
+    'the sync loop does not fight the fade');
+  assert.ok(code.includes('naturalEnd ? CROSSFADE_MS : QUICK_FADE_MS'),
+    'skips get a short fade instead of a 4 second tail');
+  assert.ok(code.includes('if (fadeRef.current) stopFade(true)'),
+    'pausing the room kills the tail');
+});
+
+test('the room timeline moves early so every guest hears the same overlap', () => {
+  const code = fs.readFileSync('src/components/NowPlaying.tsx', 'utf8');
+  const { CROSSFADE_SEC, PRELOAD_LEAD_SEC, MIN_CROSSFADE_TRACK_SEC } = load('src/lib/playback.ts');
+  assert.ok(PRELOAD_LEAD_SEC > CROSSFADE_SEC + 8,
+    'the next song has time to boot a player and buffer before the mix');
+  assert.ok(MIN_CROSSFADE_TRACK_SEC >= 45, 'short clips are never crossfaded');
+
+  assert.ok(code.includes('remaining <= PRELOAD_LEAD_SEC'), 'preload is scheduled off the playhead');
+  const arm = code.slice(code.indexOf('remaining <= CROSSFADE_SEC &&'));
+  assert.ok(arm.slice(0, 400).includes('preloadStateRef.current === "ready"'),
+    'the end is only reported early when the next song is really primed');
+  assert.ok(arm.slice(0, 400).includes('!endedReportedRef.current.has(trackKey)'),
+    'reported once per track');
+  assert.ok(code.includes('const canCrossfade') && code.includes('party.durationSec >= MIN_CROSSFADE_TRACK_SEC'),
+    'and only for a real song with something queued behind it');
 });

@@ -7,10 +7,53 @@ Tests cover:
 2. Stable YouTube player hosts, cancelled startup, retry creation, and resetting rejected API loads (`src/lib/yt-loader.ts`).
 3. World-clock exact millisecond synchronization using multi-sample NTP-style RTT filtering anchored to `performance.now()` (`src/lib/clock.ts`).
 4. Contextual & curated song suggestions for the queue (`src/lib/suggestions.ts` & `/api/suggestions`).
-5. Playhead store fan-out, single-advance queue guard, duration self-repair, poll hygiene,
+5. Equal-power crossfade gains, the early-end-report guard, the two-deck hand-over and the
+   end-of-track hold (round 3).
+6. Playhead store fan-out, single-advance queue guard, duration self-repair, poll hygiene,
    seek hysteresis, reload-without-a-sound-prompt, host-only controls, PC-first layout and the
    transparent lyrics panel (round 2 audit).
-6. Same-page Name + Password entry (`src/components/EntryGate.tsx`) and full Queue History (`status === "done"`) with scroll-up support and "Next playing" icon indicator (`src/components/QueuePanel.tsx`).
+7. Same-page Name + Password entry (`src/components/EntryGate.tsx`) and full Queue History (`status === "done"`) with scroll-up support and "Next playing" icon indicator (`src/components/QueuePanel.tsx`).
+
+## Songs overlap — the music never stops
+
+Two persistent YouTube decks sit stacked in the poster. One owns the room's current track;
+the other preloads the next one and then plays the outgoing track's tail while the two
+crossfade. Roles swap on every song change, so a hand-over costs no iframe boot and no reload.
+
+| Stage | What happens |
+| --- | --- |
+| `PRELOAD_LEAD_SEC` (18s) left | the idle deck loads the next video muted, then pauses itself back at 0 the moment it reports PLAYING — `cueVideoById` does *not* fetch media, so this is the only way to have a primed decoder |
+| `CROSSFADE_SEC` (4s) left | the first client to get there reports `ended` **early**; the server promotes the next track, so the whole room moves to the new timeline at the same instant |
+| the switch | decks swap roles. The incoming deck is already rolling, so it just `playVideo()`s and ramps up while the outgoing one plays the song's last seconds and ramps down |
+| overlap | equal-power gains (`sin`/`cos`, so there is no loudness dip in the middle) over 4s, with a matching opacity cross-dissolve between the two video frames |
+| end of fade | the outgoing deck is stopped, muted and becomes the idle deck for the next song |
+
+Guards:
+* No crossfade without something queued behind the current track, while paused, or for clips
+  shorter than `MIN_CROSSFADE_TRACK_SEC` (45s).
+* The early `ended` report only fires when the next song is genuinely primed, so a failed
+  preload can never cut a track short — it just falls back to a normal switch.
+* Skips, deletes and any other unexpected change get a 900ms fade instead of the 4s tail, and
+  still use the preloaded deck when it is available.
+* Pausing the room, a recovery rebuild or another track change mid-fade stops the tail
+  immediately; the sync loop never fights the ramp (`isFading` owns the volume).
+* `shouldAcceptEndReport` (server) rejects an `ended` that arrives more than
+  `CROSSFADE_SEC + 4` seconds early, so a stale client cannot cut a song in half. The player's
+  own measured duration wins when it is shorter than the stored one — that is the "metadata
+  lied" case, which used to stall the room until the watchdog.
+
+## A finished track is never replayed
+
+The old symptom: at the end of a song the first seconds played again two or three times before
+the next track arrived. The sync loop saw `party.isPlaying` with the player not in
+PLAYING/BUFFERING and called `playVideo()` — and `playVideo()` on an ENDED video restarts it
+from zero, which then ended again, in a loop until the server advanced.
+
+Reaching the end now latches `endedHoldRef` for that track. While it is held the deck issues no
+play nudge, no corrective seek and no stall rebuild; it simply rests on the last frame until the
+room moves on (the hold is released by a track change, or by scrubbing back into the song).
+With crossfade enabled the room advances before the video ever reaches its end, so this is the
+backstop rather than the normal path.
 
 ## Song changes heal themselves (no page refresh)
 

@@ -16,6 +16,7 @@ import {
   LoaderCircle,
   Clock,
   RefreshCw,
+  Shuffle,
 } from "lucide-react";
 import {
   createPlayer,
@@ -33,9 +34,14 @@ import {
 } from "@/lib/clock";
 import {
   classifyPlayerError,
+  crossfadeGains,
   planRecovery,
   shouldHealStall,
   shouldRetryLoad,
+  CROSSFADE_SEC,
+  MIN_CROSSFADE_TRACK_SEC,
+  PRELOAD_LEAD_SEC,
+  QUICK_FADE_MS,
   type PlayerErrorKind,
 } from "@/lib/playback";
 import {
@@ -62,6 +68,9 @@ const AUTOPLAY_BLOCK_MS = 1100;
 // Small lead compensation (40ms) when issuing an active seek so decoder buffer
 // resume lands right on the world-clock playhead.
 const SEEK_LEAD_SEC = 0.04;
+// Volume ramp resolution during a crossfade.
+const FADE_STEP_MS = 60;
+const CROSSFADE_MS = CROSSFADE_SEC * 1000;
 
 export default function NowPlaying({
   snap,
@@ -78,8 +87,32 @@ export default function NowPlaying({
   onGoDiscover: () => void;
 }) {
   const lifecycleRef = useRef(new AbortController());
-  const mountRef = useRef<HTMLDivElement | null>(null);
+  const idleLifecycleRef = useRef(new AbortController());
+  /* Two decks. `playerRef` is always the one that owns the room's current
+     track; `idlePlayerRef` is the other one — it preloads the next song and
+     then plays the outgoing song's tail while the two crossfade. They swap
+     roles on every natural song change. */
+  const hostARef = useRef<HTMLDivElement | null>(null);
+  const hostBRef = useRef<HTMLDivElement | null>(null);
+  const activeDeckRef = useRef<"A" | "B">("A");
   const playerRef = useRef<YTPlayer | null>(null);
+  const idlePlayerRef = useRef<YTPlayer | null>(null);
+  const idleReadyRef = useRef(false);
+  const idleCreatingRef = useRef(false);
+  /** videoId armed on the idle deck, and how far that preload has got. */
+  const preloadedVideoRef = useRef<string | null>(null);
+  const preloadStateRef = useRef<"idle" | "loading" | "ready">("idle");
+  /** Track key whose ending we reported early to open the crossfade. */
+  const armedEndTrackRef = useRef<string | null>(null);
+  /** Track key that has hit YouTube's ENDED — never nudge it back to life. */
+  const endedHoldRef = useRef<string | null>(null);
+  const fadeRef = useRef<{
+    incoming: YTPlayer | null;
+    outgoing: YTPlayer | null;
+    startedAt: number;
+    ms: number;
+  } | null>(null);
+  const fadeTimerRef = useRef<number | null>(null);
   const readyRef = useRef(false);
 
   /* ---------- track identity ---------- */
@@ -137,6 +170,9 @@ export default function NowPlaying({
   const [playerProblem, setPlayerProblem] = useState("");
   const [healing, setHealing] = useState(false);
   const [soundBlocked, setSoundBlocked] = useState(false);
+  const [activeDeck, setActiveDeck] = useState<"A" | "B">("A");
+  const [fadeMs, setFadeMs] = useState(CROSSFADE_MS);
+  const [crossfading, setCrossfading] = useState(false);
   // optimistic transport state (cleared as soon as the server confirms)
   const [uiPlaying, setUiPlaying] = useState<boolean | null>(null);
   // track key currently confirmed playing — drives the "switching" overlay
@@ -194,6 +230,87 @@ export default function NowPlaying({
     return computeExpectedPosition(s.party, worldNowMs()).positionSec;
   }, [worldNowMs]);
 
+  /* ---------- deck plumbing ---------- */
+  const hostFor = useCallback(
+    (deck: "A" | "B") => (deck === "A" ? hostARef.current : hostBRef.current),
+    []
+  );
+
+  /** True while this player's volume is owned by a running crossfade. */
+  const isFading = useCallback((p: YTPlayer | null) => {
+    const f = fadeRef.current;
+    if (!f || !p) return false;
+    return f.incoming === p || f.outgoing === p;
+  }, []);
+
+  const stopFade = useCallback((finish: boolean) => {
+    if (fadeTimerRef.current !== null) {
+      window.clearInterval(fadeTimerRef.current);
+      fadeTimerRef.current = null;
+    }
+    const f = fadeRef.current;
+    fadeRef.current = null;
+    setCrossfading(false);
+    if (!f) return;
+    const roomVolume = mutedRef.current ? 0 : volumeRef.current;
+    try {
+      if (finish) f.incoming?.setVolume(roomVolume);
+    } catch {
+      /* bridge busy */
+    }
+    try {
+      // The outgoing deck becomes the idle deck: silent and out of the way.
+      f.outgoing?.stopVideo();
+      f.outgoing?.mute();
+      f.outgoing?.setVolume(0);
+    } catch {
+      /* bridge busy */
+    }
+  }, []);
+
+  /**
+   * Overlap two songs. The incoming deck is already playing; its volume
+   * ramps up on an equal-power curve while the outgoing one ramps down and
+   * is then stopped. Audio never drops to silence in between.
+   */
+  const runCrossfade = useCallback(
+    (incoming: YTPlayer | null, outgoing: YTPlayer | null, ms: number) => {
+      stopFade(false);
+      if (!outgoing || ms <= 0) {
+        try {
+          incoming?.setVolume(mutedRef.current ? 0 : volumeRef.current);
+        } catch {
+          /* bridge busy */
+        }
+        return;
+      }
+      const startedAt = Date.now();
+      fadeRef.current = { incoming, outgoing, startedAt, ms };
+      setCrossfading(true);
+      const step = () => {
+        const f = fadeRef.current;
+        if (!f) return;
+        const progress = (Date.now() - f.startedAt) / f.ms;
+        const roomVolume = mutedRef.current ? 0 : volumeRef.current;
+        const gains = crossfadeGains(progress);
+        try {
+          f.incoming?.setVolume(Math.round(roomVolume * gains.incoming));
+        } catch {
+          /* bridge busy */
+        }
+        try {
+          f.outgoing?.setVolume(Math.round(roomVolume * gains.outgoing));
+        } catch {
+          /* bridge busy */
+        }
+        if (progress >= 1) stopFade(true);
+      };
+      step();
+      fadeTimerRef.current = window.setInterval(step, FADE_STEP_MS);
+    },
+    [stopFade]
+  );
+
   /* ---------- sound: ON automatically whenever the browser allows it ---------- */
   const ensureAudioActive = useCallback((p: YTPlayer | null) => {
     if (!p) return;
@@ -214,7 +331,8 @@ export default function NowPlaying({
       // Always *try* with sound — most reloads are allowed to play audibly
       // and should never show a prompt.
       if (p.isMuted()) p.unMute();
-      p.setVolume(volumeRef.current || 80);
+      // A crossfade owns the volume of both of its decks until it finishes.
+      if (!isFading(p)) p.setVolume(volumeRef.current || 80);
       setSoundBlocked(p.isMuted());
     } catch {
       /* player bridge still initializing */
@@ -427,6 +545,24 @@ export default function NowPlaying({
 
   const handleStateChange = useCallback(
     (state: number, target?: YTPlayer) => {
+      /* The idle deck only ever reports on its preload. As soon as the
+         next song starts rolling we park it back at 0: paused, buffered
+         and able to resume the instant the crossfade begins. */
+      if (target && target === idlePlayerRef.current) {
+        if (state === YT_STATE.PLAYING && preloadStateRef.current === "loading") {
+          preloadStateRef.current = "ready";
+          try {
+            target.pauseVideo();
+            target.seekTo(0, true);
+            target.mute();
+            target.setVolume(0);
+          } catch {
+            /* bridge busy — the sync tick will retry the preload */
+          }
+          disableCaptions(target);
+        }
+        return;
+      }
       if (target && target !== playerRef.current) return;
       const s = snapRef.current;
 
@@ -439,10 +575,27 @@ export default function NowPlaying({
         }
         const qid = appliedQidRef.current ?? np.queueId ?? null;
         const key = `${qid ?? 0}:${np.videoId}`;
-        if (endedReportedRef.current.has(key)) return;
+        // Freeze on the last frame instead of letting the sync loop restart
+        // the video while the room catches up.
+        endedHoldRef.current = key;
+        // If the crossfade reported this track early and the room still has
+        // not moved on, the early report was rejected — the real ending is
+        // worth exactly one more attempt.
+        const earlyAttempt = armedEndTrackRef.current === key;
+        if (endedReportedRef.current.has(key) && !earlyAttempt) return;
+        armedEndTrackRef.current = null;
         endedReportedRef.current.add(key);
+        let measured = 0;
+        try {
+          measured = playerRef.current?.getDuration() ?? 0;
+        } catch {
+          measured = 0;
+        }
         onPlayerActionRef
-          .current("ended", { queueId: qid })
+          .current("ended", {
+            queueId: qid,
+            durationSec: Number.isFinite(measured) ? Math.round(measured) : 0,
+          })
           .catch(() => undefined);
         return;
       }
@@ -461,6 +614,8 @@ export default function NowPlaying({
 
         if (onTrack && (state === YT_STATE.PLAYING || state === YT_STATE.BUFFERING)) {
           loadConfirmedRef.current = true;
+          // It is playing again (host scrubbed back, or a fresh load).
+          endedHoldRef.current = null;
           if (state === YT_STATE.PLAYING && !forceMutedRef.current) {
             try {
               if (!playerRef.current?.isMuted()) audiblePlaybackRef.current = true;
@@ -517,6 +672,14 @@ export default function NowPlaying({
 
   const handleError = useCallback(
     (code: number, target?: YTPlayer) => {
+      if (target && target === idlePlayerRef.current) {
+        // The next song cannot be preloaded: no crossfade, no early end
+        // report. The active deck will hit the same error later and the
+        // normal unplayable path skips it for the whole room.
+        preloadedVideoRef.current = null;
+        preloadStateRef.current = "idle";
+        return;
+      }
       if (target && target !== playerRef.current) return;
       const np = snapRef.current?.nowPlaying;
       if (!np?.videoId) return;
@@ -533,7 +696,7 @@ export default function NowPlaying({
   /* ---------- create or recreate the player in place ---------- */
   const mountPlayer = useCallback(
     (startMuted?: boolean) => {
-      const el = mountRef.current;
+      const el = hostFor(activeDeckRef.current);
       if (!el || playerRef.current || creatingRef.current) return;
       creatingRef.current = true;
       const signal = lifecycleRef.current.signal;
@@ -578,11 +741,91 @@ export default function NowPlaying({
           if (!signal.aborted) creatingRef.current = false;
         });
     },
-    [handleStateChange, handleError, ensureAudioActive, startRecovery, setProblem]
+    [
+      handleStateChange,
+      handleError,
+      ensureAudioActive,
+      startRecovery,
+      setProblem,
+      hostFor,
+    ]
+  );
+
+  /* ---------- the second deck: preload the next song ---------- */
+  const mountIdleDeck = useCallback(() => {
+    if (idlePlayerRef.current || idleCreatingRef.current) return;
+    const el = hostFor(activeDeckRef.current === "A" ? "B" : "A");
+    if (!el) return;
+    idleCreatingRef.current = true;
+    idleLifecycleRef.current = new AbortController();
+    const signal = idleLifecycleRef.current.signal;
+    createPlayer(
+      el,
+      {
+        onReady: (p) => {
+          idlePlayerRef.current = p;
+          idleReadyRef.current = true;
+          try {
+            p.mute();
+            p.setVolume(0);
+          } catch {
+            /* bridge busy */
+          }
+          disableCaptions(p);
+        },
+        onStateChange: handleStateChange,
+        onError: handleError,
+        onApiChange: (p) => disableCaptions(p),
+      },
+      signal,
+      { startMuted: true }
+    )
+      .catch(() => {
+        // No second deck means no crossfade — never a broken room.
+        idlePlayerRef.current = null;
+        idleReadyRef.current = false;
+      })
+      .finally(() => {
+        idleCreatingRef.current = false;
+      });
+  }, [handleStateChange, handleError, hostFor]);
+
+  const resetPreload = useCallback(() => {
+    preloadedVideoRef.current = null;
+    preloadStateRef.current = "idle";
+  }, []);
+
+  /**
+   * Buffer the next song on the idle deck. `cueVideoById` does not fetch
+   * media, so we start it muted and pause it back at 0 the moment it
+   * reports PLAYING — that leaves a primed decoder that resumes instantly.
+   */
+  const preloadNext = useCallback(
+    (videoId: string) => {
+      if (fadeRef.current) return; // the idle deck is busy playing a tail
+      if (preloadedVideoRef.current === videoId) return;
+      mountIdleDeck();
+      const p = idlePlayerRef.current;
+      if (!p || !idleReadyRef.current) return;
+      preloadedVideoRef.current = videoId;
+      preloadStateRef.current = "loading";
+      try {
+        p.mute();
+        p.setVolume(0);
+        p.loadVideoById({ videoId, startSeconds: 0 });
+        disableCaptions(p);
+      } catch {
+        resetPreload();
+      }
+    },
+    [mountIdleDeck, resetPreload]
   );
 
   const rebuildPlayer = useCallback(
     (startMuted?: boolean) => {
+      // A rebuild invalidates whichever deck was fading — drop the ramp
+      // before the player it points at disappears.
+      stopFade(false);
       // Cancel any creation still in flight so we never end up with two
       // players racing for the same mount node.
       if (creatingRef.current) {
@@ -608,12 +851,70 @@ export default function NowPlaying({
       setReady(false);
       mountPlayer(startMuted);
     },
-    [mountPlayer]
+    [mountPlayer, stopFade]
   );
 
   useEffect(() => {
     rebuildPlayerRef.current = rebuildPlayer;
   }, [rebuildPlayer]);
+
+  /* ---------- hand the room over to the preloaded deck ---------- */
+  const swapToIdleDeck = useCallback(
+    (
+      videoId: string,
+      trackKey: string,
+      queueId: number | null,
+      ms: number
+    ): boolean => {
+      const outgoing = playerRef.current;
+      const incoming = idlePlayerRef.current;
+      if (!incoming) return false;
+
+      // Roles swap: the preloaded deck becomes the room's deck.
+      playerRef.current = incoming;
+      idlePlayerRef.current = outgoing;
+      readyRef.current = true;
+      idleReadyRef.current = !!outgoing;
+      const nextDeck = activeDeckRef.current === "A" ? "B" : "A";
+      activeDeckRef.current = nextDeck;
+      setFadeMs(ms);
+      setActiveDeck(nextDeck);
+      resetPreload();
+      armedEndTrackRef.current = null;
+      endedHoldRef.current = null;
+
+      // Per-track bookkeeping, exactly as a fresh load would do.
+      appliedTrackKeyRef.current = trackKey;
+      appliedQidRef.current = queueId;
+      wantedVideoIdRef.current = videoId;
+      loadStartedAtRef.current = Date.now();
+      lastHealthyAtRef.current = Date.now();
+      loadConfirmedRef.current = false;
+      autoUnmuteTriedRef.current = false;
+      driftStrikesRef.current = 0;
+      pendingSeekRef.current = false;
+      // It is already playing, so never flash the "loading track…" overlay.
+      setLoadedKey(trackKey);
+
+      try {
+        if (!mutedRef.current && volumeRef.current > 0 && !forceMutedRef.current) {
+          incoming.unMute();
+        }
+        incoming.setVolume(0);
+        const expected = expectedPos();
+        if (expected > 0.4) incoming.seekTo(expected + SEEK_LEAD_SEC, true);
+        incoming.playVideo();
+        disableCaptions(incoming);
+      } catch {
+        startRecovery("transient");
+        return true;
+      }
+
+      runCrossfade(incoming, outgoing, ms);
+      return true;
+    },
+    [expectedPos, resetPreload, runCrossfade, setLoadedKey, startRecovery]
+  );
 
   /* ---------- load a track onto the live player ---------- */
   const loadTrack = useCallback(
@@ -632,6 +933,7 @@ export default function NowPlaying({
       loadConfirmedRef.current = false;
       autoUnmuteTriedRef.current = false;
       driftStrikesRef.current = 0;
+      endedHoldRef.current = null;
       pendingSeekRef.current = true;
       setLoadedKey(null);
 
@@ -696,6 +998,46 @@ export default function NowPlaying({
             clearRecoveryTimer();
             setHealing(false);
             setProblem("");
+
+            /* Crossfade: if the next song is already primed on the idle
+               deck, hand over to it instead of tearing down the audio.
+               A natural ending gets the full overlap; a skip or a deleted
+               track gets a short fade so it still never cuts to silence. */
+            const primed =
+              !!idlePlayerRef.current &&
+              idleReadyRef.current &&
+              preloadStateRef.current === "ready" &&
+              preloadedVideoRef.current === np.videoId;
+            /* A natural ending gets the full overlap. Only one guest
+               actually reports the end, so decide from where the outgoing
+               deck really is — every client then mixes identically. */
+            let outgoingRemaining = Infinity;
+            try {
+              const cur = player.getCurrentTime();
+              const dur = player.getDuration();
+              if (dur > 0 && Number.isFinite(cur)) outgoingRemaining = dur - cur;
+            } catch {
+              /* bridge busy */
+            }
+            const naturalEnd =
+              armedEndTrackRef.current === appliedTrackKeyRef.current ||
+              outgoingRemaining <= CROSSFADE_SEC + 2.5;
+            if (
+              primed &&
+              party.isPlaying &&
+              expectedPos() < CROSSFADE_SEC + 2 &&
+              swapToIdleDeck(
+                np.videoId,
+                trackKey,
+                np.queueId,
+                naturalEnd ? CROSSFADE_MS : QUICK_FADE_MS
+              )
+            ) {
+              return;
+            }
+
+            stopFade(true);
+            setFadeMs(220);
             loadTrack(player, np.videoId, trackKey, np.queueId, party.isPlaying);
             return;
           }
@@ -737,7 +1079,26 @@ export default function NowPlaying({
             return;
           }
 
-          if (party.isPlaying) {
+          /* ---- the track is over, the room just has not caught up ----
+             Calling playVideo() on a finished video restarts it from zero,
+             which is why the first seconds used to play over and over
+             until the next song arrived. Hold still instead. */
+          if (st === YT_STATE.ENDED) endedHoldRef.current = trackKey;
+          if (
+            endedHoldRef.current === trackKey &&
+            party.durationSec > 0 &&
+            expected < party.durationSec - 5
+          ) {
+            // The host scrubbed back into the track: it is live again.
+            endedHoldRef.current = null;
+          }
+          const endedHold = endedHoldRef.current === trackKey;
+          if (endedHold) {
+            lastHealthyAtRef.current = Date.now();
+            driftStrikesRef.current = 0;
+          }
+
+          if (party.isPlaying && !endedHold) {
             if (
               st !== YT_STATE.PLAYING &&
               st !== YT_STATE.BUFFERING &&
@@ -750,10 +1111,12 @@ export default function NowPlaying({
                 /* handled by the stall detector below */
               }
             }
-          } else {
+          } else if (!party.isPlaying) {
             if (st === YT_STATE.PLAYING || st === YT_STATE.BUFFERING) {
               player.pauseVideo();
             }
+            // Nothing should keep playing behind a paused room.
+            if (fadeRef.current) stopFade(true);
           }
 
           /* ---- automatic healing: did the load actually take? ---- */
@@ -771,6 +1134,7 @@ export default function NowPlaying({
           if (loadNeverStarted && recoveryTimerRef.current === null) {
             startRecovery("transient");
           } else if (
+            !endedHold &&
             shouldHealStall({
               shouldPlay: party.isPlaying,
               playerState: st,
@@ -844,6 +1208,56 @@ export default function NowPlaying({
               }
             }
           }
+
+          /* ---- crossfade scheduling ----
+             The overlap only works if every guest switches at the same
+             instant, so the room timeline itself moves CROSSFADE_SEC
+             early: whoever gets there first reports the end, the server
+             promotes the next track, and each client plays the tail of
+             the old one locally while fading it out. */
+          const nextUp = s.queue[0] ?? null;
+          const remaining = party.durationSec > 0 ? party.durationSec - expected : Infinity;
+          const canCrossfade =
+            !!nextUp &&
+            party.isPlaying &&
+            !endedHold &&
+            party.durationSec >= MIN_CROSSFADE_TRACK_SEC;
+
+          if (canCrossfade && nextUp) {
+            if (remaining <= PRELOAD_LEAD_SEC && remaining > CROSSFADE_SEC * 0.5) {
+              preloadNext(nextUp.videoId);
+            } else if (
+              loadConfirmedRef.current &&
+              msSinceLoad > 4000 &&
+              !idlePlayerRef.current &&
+              !idleCreatingRef.current
+            ) {
+              // Boot the second deck well before it is needed.
+              mountIdleDeck();
+            }
+
+            if (
+              remaining <= CROSSFADE_SEC &&
+              preloadStateRef.current === "ready" &&
+              preloadedVideoRef.current === nextUp.videoId &&
+              !endedReportedRef.current.has(trackKey)
+            ) {
+              endedReportedRef.current.add(trackKey);
+              armedEndTrackRef.current = trackKey;
+              let measured = 0;
+              try {
+                measured = player.getDuration();
+              } catch {
+                measured = 0;
+              }
+              onPlayerActionRef
+                .current("ended", {
+                  queueId: np.queueId,
+                  durationSec: Number.isFinite(measured) ? Math.round(measured) : 0,
+                })
+                .catch(() => undefined);
+            }
+          }
         } else if (appliedTrackKeyRef.current !== null) {
           appliedTrackKeyRef.current = null;
           appliedQidRef.current = null;
@@ -866,10 +1280,14 @@ export default function NowPlaying({
     [
       expectedPos,
       mountPlayer,
+      mountIdleDeck,
+      preloadNext,
       rebuildPlayer,
       ensureAudioActive,
       loadTrack,
       startRecovery,
+      stopFade,
+      swapToIdleDeck,
       clearRecoveryTimer,
       currentPlayerVideoId,
       markHealthy,
@@ -888,16 +1306,32 @@ export default function NowPlaying({
     mountPlayer();
     return () => {
       lifecycleRef.current.abort();
+      idleLifecycleRef.current.abort();
       if (recoveryTimerRef.current !== null) {
         window.clearTimeout(recoveryTimerRef.current);
         recoveryTimerRef.current = null;
       }
+      if (fadeTimerRef.current !== null) {
+        window.clearInterval(fadeTimerRef.current);
+        fadeTimerRef.current = null;
+      }
+      fadeRef.current = null;
       try {
         playerRef.current?.destroy();
       } catch {
         /* ignore */
       }
+      try {
+        idlePlayerRef.current?.destroy();
+      } catch {
+        /* ignore */
+      }
       playerRef.current = null;
+      idlePlayerRef.current = null;
+      idleReadyRef.current = false;
+      idleCreatingRef.current = false;
+      preloadedVideoRef.current = null;
+      preloadStateRef.current = "idle";
       readyRef.current = false;
       creatingRef.current = false;
       appliedTrackKeyRef.current = null;
@@ -1187,13 +1621,30 @@ export default function NowPlaying({
           }}
         >
           <div className="relative aspect-square w-full overflow-hidden rounded-[2.05rem] bg-black shadow-[0_40px_110px_rgba(0,0,0,0.8)]">
-            {/* Persistent YouTube player container — stays mounted so iframe never reloads */}
+            {/* Two persistent YouTube decks. One owns the current track, the
+                other preloads the next one and plays the outgoing tail, so a
+                song change cross-dissolves instead of cutting to black. */}
             <div
-              className={`absolute inset-0 z-0 [&>div]:h-full [&>div]:w-full ${
-                np ? "opacity-100" : "pointer-events-none opacity-0"
+              className={`absolute inset-0 z-0 ${
+                np ? "" : "pointer-events-none opacity-0"
               }`}
             >
-              <div ref={mountRef} className="h-full w-full" />
+              <div
+                ref={hostARef}
+                className="absolute inset-0 [&>div]:h-full [&>div]:w-full [&>iframe]:h-full [&>iframe]:w-full"
+                style={{
+                  opacity: activeDeck === "A" ? 1 : 0,
+                  transition: `opacity ${fadeMs}ms linear`,
+                }}
+              />
+              <div
+                ref={hostBRef}
+                className="absolute inset-0 [&>div]:h-full [&>div]:w-full [&>iframe]:h-full [&>iframe]:w-full"
+                style={{
+                  opacity: activeDeck === "B" ? 1 : 0,
+                  transition: `opacity ${fadeMs}ms linear`,
+                }}
+              />
             </div>
 
             {/* Tap-anywhere sound unlock. Also shields YouTube's own overlay
@@ -1241,7 +1692,11 @@ export default function NowPlaying({
                 {/* top strip */}
                 <div className="absolute left-0 right-0 top-0 z-20 flex items-start justify-between p-3 sm:p-4">
                   <div className="flex flex-wrap items-center gap-1.5">
-                    {isPlaying ? (
+                    {crossfading ? (
+                      <span className="flex items-center gap-1.5 rounded-full border border-cyan-300/40 bg-black/60 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.22em] text-cyan-200 backdrop-blur-md">
+                        <Shuffle className="h-3 w-3" /> mixing
+                      </span>
+                    ) : isPlaying ? (
                       <span className="animate-pulse-ring flex items-center gap-1.5 rounded-full border border-red-400/40 bg-black/60 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.22em] text-red-300 backdrop-blur-md">
                         <Signal className="h-3 w-3" /> live
                       </span>

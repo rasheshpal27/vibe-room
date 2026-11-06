@@ -4,11 +4,13 @@ import { partyState, queueItems } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import {
   advanceQueue,
+  elapsedSec,
   ensureState,
   isAdminKey,
   STATE_ID,
   systemMessage,
 } from "@/lib/party";
+import { shouldAcceptEndReport } from "@/lib/playback";
 
 export const dynamic = "force-dynamic";
 
@@ -25,6 +27,18 @@ export async function POST(req: NextRequest) {
   if (action === "ended") {
     const qid = Number(body.queueId ?? 0);
     if (state.currentQueueId && qid === state.currentQueueId) {
+      // Clients report the end themselves, and with crossfade they do it a
+      // few seconds early on purpose so the next song can overlap. A report
+      // that is far too early (stale client, wrong clock) must not cut the
+      // track short for everyone.
+      const accepted = shouldAcceptEndReport({
+        elapsedSec: elapsedSec(state),
+        stateDurationSec: state.durationSec ?? 0,
+        clientDurationSec: Number(body.durationSec ?? 0) || null,
+      });
+      if (!accepted) {
+        return NextResponse.json({ ok: true, ignored: "too-early" });
+      }
       // Pass the id so simultaneous reports from every guest can only ever
       // advance this one track (otherwise the room skips a song).
       await advanceQueue(qid);
