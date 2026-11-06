@@ -18,6 +18,7 @@ import {
   LoaderCircle,
   SkipForward,
   MicVocal,
+  WifiOff,
 } from "lucide-react";
 import Aurora from "./Aurora";
 import NowPlaying from "./NowPlaying";
@@ -25,14 +26,28 @@ import LyricsOverlay from "./LyricsOverlay";
 import QueuePanel from "./QueuePanel";
 import SearchPanel from "./SearchPanel";
 import ChatPanel from "./ChatPanel";
-import type { PartySnapshot } from "@/lib/types";
+import FloatingReactions, { ReactionBar } from "./FloatingReactions";
+import { addClockSample, resetClockSamples } from "@/lib/clock-store";
+import {
+  connectionStatus,
+  nextPollDelayMs,
+  shouldForceResyncOnRecovery,
+  POLL_MS_VISIBLE,
+  type ConnectionStatus,
+} from "@/lib/connection";
+import { createTicker, type Ticker } from "@/lib/ticker";
+import { isIdempotentAction, postJson } from "@/lib/net";
+import { emitRoomEvent } from "@/lib/room-events";
+import { applyRoomTheme, extractPaletteFromImage } from "@/lib/palette";
+import { REACTION_WINDOW_MS } from "@/lib/reactions";
+import { ytThumb, type PartySnapshot, type ReactionDTO } from "@/lib/types";
 import type { JoinedUser } from "./EntryGate";
 
 const LS_ADMIN = "vibe_admin_key";
-/** Room poll interval. Paused entirely while the tab is hidden. */
-const POLL_MS = 1000;
 /** A poll that takes longer than this is a dead connection, not a slow one. */
 const POLL_TIMEOUT_MS = 8000;
+/** Keep the merged chat log bounded, exactly like the server window. */
+const MAX_CHAT_ROWS = 60;
 type Tab = "deck" | "lyrics" | "queue" | "search" | "chat";
 type RightTab = "queue" | "search" | "chat";
 
@@ -50,6 +65,7 @@ function renderSignature(d: PartySnapshot): string {
     h: d.history.map((x) => x.id),
     u: d.users.map((x) => `${x.id}:${x.name}:${x.isAdmin}:${x.color}`),
     c: d.chat.map((x) => x.id),
+    r: d.reactions.map((x) => x.id),
     y: d.you ? `${d.you.id}:${d.you.isAdmin}:${d.you.color}` : null,
   });
 }
@@ -66,29 +82,126 @@ export default function PartyShell({
   const [snap, setSnap] = useState<PartySnapshot | null>(null);
   const [tab, setTab] = useState<Tab>("deck");
   const [rightTab, setRightTab] = useState<RightTab>("queue");
-  const [adminKey, setAdminKey] = useState("");
+  // Read straight out of storage: PartyShell only ever mounts on the client
+  // (the gate decides), so there is no server render to mismatch.
+  const [adminKey, setAdminKey] = useState(() =>
+    typeof window === "undefined" ? "" : localStorage.getItem(LS_ADMIN) ?? ""
+  );
   const [hostModal, setHostModal] = useState(false);
   const [unreadChat, setUnreadChat] = useState(0);
+  const [conn, setConn] = useState<ConnectionStatus>("online");
+  /** Reactions this device just sent — floated before the server echoes them. */
+  const [localReactions, setLocalReactions] = useState<ReactionDTO[]>([]);
   const lastChatIdRef = useRef(0);
   const seenFirstSnapRef = useRef(false);
   const signatureRef = useRef("");
   const inFlightRef = useRef(false);
   const tabRef = useRef<Tab>("deck");
   const rightTabRef = useRef<RightTab>("queue");
-  tabRef.current = tab;
-  rightTabRef.current = rightTab;
+  // Mirrored in an effect rather than during render: the poll reads these to
+  // decide whether a new message counts as unread, and a render-phase ref
+  // write is exactly what the React compiler forbids.
+  useEffect(() => {
+    tabRef.current = tab;
+    rightTabRef.current = rightTab;
+  }, [tab, rightTab]);
+
+  /* ---------- transport ---------- */
+  const snapRef = useRef<PartySnapshot | null>(null);
+  const etagRef = useRef("");
+  /** Consecutive failed polls. Drives the banner and the backoff. */
+  const failuresRef = useRef(0);
+  const lastOkAtRef = useRef(0);
+  /** Ask for the whole chat window instead of an increment. */
+  const needFullChatRef = useRef(true);
+  const tickerRef = useRef<Ticker | null>(null);
+  const connRef = useRef<ConnectionStatus>("online");
+
+  const isHidden = () =>
+    typeof document !== "undefined" && document.visibilityState === "hidden";
+  const isOnline = () =>
+    typeof navigator === "undefined" || navigator.onLine !== false;
+
+  /** Re-aim the poll timer after every attempt (cadence depends on outcome). */
+  const retuneTicker = useCallback(() => {
+    tickerRef.current?.setDelay(
+      nextPollDelayMs({
+        failures: failuresRef.current,
+        hidden: isHidden(),
+        online: isOnline(),
+      })
+    );
+  }, []);
+
+  const markPollOk = useCallback(() => {
+    const failures = failuresRef.current;
+    const lastOk = lastOkAtRef.current;
+    failuresRef.current = 0;
+    lastOkAtRef.current = Date.now();
+    if (connRef.current !== "online") {
+      connRef.current = "online";
+      setConn("online");
+    }
+    /* Back after a gap. Everything the deck believes about the playhead was
+       extrapolated from a stale anchor, so throw the clock samples away and
+       make the player re-seek onto the room timeline instead of drifting
+       back in over the next minute. */
+    if (lastOk && shouldForceResyncOnRecovery(failures, Date.now() - lastOk)) {
+      resetClockSamples();
+      emitRoomEvent({ type: "force-resync" });
+    }
+  }, []);
+
+  const markPollFailed = useCallback(() => {
+    failuresRef.current += 1;
+    const next = connectionStatus(failuresRef.current, isOnline());
+    if (next !== connRef.current) {
+      connRef.current = next;
+      setConn(next);
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     // One request at a time: on a slow link, overlapping 1s polls pile up
     // and every one of them costs the server a snapshot query.
     if (inFlightRef.current) return;
     inFlightRef.current = true;
+    const t0 = typeof performance !== "undefined" ? performance.now() : 0;
     try {
-      const res = await fetch(`/api/state?u=${me.id}`, {
+      const since = needFullChatRef.current ? 0 : lastChatIdRef.current;
+      const url =
+        `/api/state?u=${me.id}` + (since > 0 ? `&chatSince=${since}` : "");
+      const headers: Record<string, string> = {};
+      // Conditional request: most polls describe a room where nothing
+      // changed, and those come back as an empty 304.
+      if (etagRef.current && snapRef.current) {
+        headers["If-None-Match"] = etagRef.current;
+      }
+
+      const res = await fetch(url, {
         cache: "no-store",
+        headers,
         signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
       });
-      if (!res.ok) return;
+      const t1 = typeof performance !== "undefined" ? performance.now() : 0;
+
+      // Every poll is a free NTP sample: the server stamps its own clock on
+      // the response (header, so a 304 carries it too).
+      const serverNow = Number(res.headers.get("X-Server-Now"));
+      if (Number.isFinite(serverNow) && serverNow > 0) {
+        addClockSample(t0, t1, serverNow);
+      }
+
+      if (res.status === 304) {
+        markPollOk();
+        return;
+      }
+      if (!res.ok) {
+        markPollFailed();
+        return;
+      }
+
+      etagRef.current = res.headers.get("ETag") ?? "";
       const data = (await res.json()) as PartySnapshot;
       if (!data.you) {
         onLeft();
@@ -98,70 +211,126 @@ export default function PartyShell({
         onMe({ ...me, isAdmin: data.you.isAdmin, color: data.you.color });
       }
 
-      const last = data.chat[data.chat.length - 1];
-      if (last && last.id !== lastChatIdRef.current) {
+      /* ---- chat: merge the increment the server sent ---- */
+      const previous = snapRef.current;
+      let chat = data.chat;
+      if (data.chatDelta) {
+        const known = previous?.chat ?? [];
+        if (data.chatMaxId < lastChatIdRef.current) {
+          // The log was cleared out from under us (host wiped the chat).
+          needFullChatRef.current = true;
+          lastChatIdRef.current = 0;
+          chat = data.chat;
+        } else {
+          chat = data.chat.length
+            ? [...known, ...data.chat].slice(-MAX_CHAT_ROWS)
+            : known;
+        }
+      } else {
+        needFullChatRef.current = false;
+      }
+      const merged: PartySnapshot = data.chatDelta ? { ...data, chat } : data;
+
+      const newestChatId = chat.length ? chat[chat.length - 1].id : 0;
+      if (newestChatId > lastChatIdRef.current) {
         const prevMax = lastChatIdRef.current;
-        lastChatIdRef.current = last.id;
+        lastChatIdRef.current = newestChatId;
         const onChat = tabRef.current === "chat" || rightTabRef.current === "chat";
         if (seenFirstSnapRef.current && !onChat) {
-          const fresh = data.chat.filter((c) => c.id > prevMax).length;
+          const fresh = chat.filter((c) => c.id > prevMax).length;
           setUnreadChat((n) => n + fresh);
         }
       }
 
       // Skip the re-render when nothing visible actually changed.
-      const sig = renderSignature(data);
+      const sig = renderSignature(merged);
       if (sig !== signatureRef.current || !seenFirstSnapRef.current) {
         signatureRef.current = sig;
-        setSnap(data);
+        snapRef.current = merged;
+        setSnap(merged);
+      } else {
+        snapRef.current = merged;
       }
       seenFirstSnapRef.current = true;
+      markPollOk();
     } catch {
-      /* keep polling */
+      markPollFailed();
     } finally {
       inFlightRef.current = false;
+      retuneTicker();
     }
-  }, [me, onLeft, onMe]);
+  }, [markPollFailed, markPollOk, me, onLeft, onMe, retuneTicker]);
 
+  const refreshRef = useRef(refresh);
   useEffect(() => {
-    refresh();
-    // A backgrounded tab must not keep hammering the room: the player is
-    // throttled by the browser anyway and re-syncs the moment we return.
-    const t = setInterval(() => {
-      if (!document.hidden) refresh();
-    }, POLL_MS);
-    const wake = () => {
-      if (!document.hidden) refresh();
+    refreshRef.current = refresh;
+  }, [refresh]);
+
+  /* ---------- the poll loop ----------
+     A hidden tab keeps polling, slowly. YouTube goes right on playing audio
+     in a background tab, but a client that stops polling never finds out the
+     song ended — the music simply stops for that listener, and after 90s of
+     no heartbeat they drop out of the room entirely. The timer itself lives
+     in a Web Worker because window timers in a hidden page are clamped (and
+     eventually throttled to once a minute) by Chrome. */
+  useEffect(() => {
+    const tick = () => {
+      void refreshRef.current();
     };
+    const ticker = createTicker(tick, POLL_MS_VISIBLE);
+    tickerRef.current = ticker;
+    tick();
+
+    const wake = () => {
+      ticker.setDelay(
+        nextPollDelayMs({
+          failures: failuresRef.current,
+          hidden: document.visibilityState === "hidden",
+          online: navigator.onLine !== false,
+        })
+      );
+      void refreshRef.current();
+    };
+    const goOffline = () => {
+      failuresRef.current = Math.max(failuresRef.current, 1);
+      connRef.current = "offline";
+      setConn("offline");
+    };
+
     document.addEventListener("visibilitychange", wake);
     window.addEventListener("focus", wake);
     window.addEventListener("online", wake);
+    window.addEventListener("offline", goOffline);
     return () => {
-      clearInterval(t);
+      ticker.stop();
+      tickerRef.current = null;
       document.removeEventListener("visibilitychange", wake);
       window.removeEventListener("focus", wake);
       window.removeEventListener("online", wake);
+      window.removeEventListener("offline", goOffline);
     };
-  }, [refresh]);
-
-  useEffect(() => {
-    const saved = localStorage.getItem(LS_ADMIN);
-    if (saved) setAdminKey(saved);
   }, []);
 
-  useEffect(() => {
-    if (tab === "chat" || rightTab === "chat") setUnreadChat(0);
-  }, [tab, rightTab]);
+  // Opening chat is a click, not a synchronisation problem — the two chat
+  // buttons clear the badge themselves, and this guard keeps it at zero for
+  // as long as the panel is on screen.
+  const chatOpen = tab === "chat" || rightTab === "chat";
+  const unreadBadge = chatOpen ? 0 : unreadChat;
 
   const isAdmin = !!adminKey;
 
   const playerAction = useCallback(
     async (action: string, extra: Record<string, unknown> = {}) => {
-      await fetch("/api/player", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action, adminKey, ...extra }),
-      });
+      /* `ended`, `duration` and `unplayable` are idempotent on the server
+         (they are keyed to a queue id) and they are the reports the room
+         cannot afford to lose: a dropped `ended` leaves everyone sitting on
+         a finished song until the overdue sweep rescues them. Retry those
+         once; a dropped pause is just a pause. */
+      await postJson(
+        "/api/player",
+        { action, adminKey, ...extra },
+        { retry: isIdempotentAction(action) }
+      );
       await refresh();
     },
     [adminKey, refresh]
@@ -197,12 +366,168 @@ export default function PartyShell({
     setRightTab("search");
   }, []);
 
+  /* ---------- floating reactions ---------- */
+  const sendReaction = useCallback(
+    (emoji: string) => {
+      // Float it instantly on this device; the poll will bring everyone
+      // else's copy about a second later.
+      const localId = -Date.now();
+      setLocalReactions((prev) => [
+        ...prev.slice(-8),
+        {
+          id: localId,
+          userId: me.id,
+          emoji,
+          userName: me.name,
+          userColor: me.color,
+          atMs: Date.now(),
+        },
+      ]);
+      window.setTimeout(() => {
+        setLocalReactions((prev) => prev.filter((r) => r.id !== localId));
+      }, REACTION_WINDOW_MS);
+      void postJson("/api/chat", {
+        userId: me.id,
+        kind: "reaction",
+        content: emoji,
+      });
+    },
+    [me]
+  );
+
   const playing = snap?.party.isPlaying && snap?.nowPlaying;
   const queueCount = snap?.queue.length ?? 0;
+  const nowVideoId = snap?.nowPlaying?.videoId ?? "";
+
+  /* ---------- per-track colour theming ----------
+     The dominant colour of the artwork becomes the room's accent, so the
+     aurora and the glows change with every song. Entirely best effort: a
+     blocked image or a tainted canvas just keeps the default violet. */
+  useEffect(() => {
+    if (!nowVideoId) {
+      applyRoomTheme(null);
+      return;
+    }
+    let cancelled = false;
+    extractPaletteFromImage(ytThumb(nowVideoId)).then((theme) => {
+      if (!cancelled) applyRoomTheme(theme);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [nowVideoId]);
+
+  /* ---------- keyboard shortcuts ---------- */
+  // Mirrored through an effect, not assigned during render: the React
+  // compiler (rightly) rejects ref writes in the render path.
+  const shortcutsRef = useRef({
+    isAdmin: false,
+    playing: false,
+    goDiscover,
+    playerAction,
+  });
+  useEffect(() => {
+    shortcutsRef.current = {
+      isAdmin,
+      playing: !!playing,
+      goDiscover,
+      playerAction,
+    };
+  }, [isAdmin, playing, goDiscover, playerAction]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (
+        el &&
+        (el.tagName === "INPUT" ||
+          el.tagName === "TEXTAREA" ||
+          el.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const { isAdmin: host, playing: isPlaying, ...rest } = shortcutsRef.current;
+
+      switch (e.key) {
+        case " ":
+        case "k":
+          if (!host) return;
+          e.preventDefault();
+          void rest.playerAction(isPlaying ? "pause" : "resume");
+          return;
+        case "ArrowLeft":
+          if (!host) return;
+          e.preventDefault();
+          emitRoomEvent({ type: "seek-by", seconds: -5 });
+          return;
+        case "ArrowRight":
+          if (!host) return;
+          e.preventDefault();
+          emitRoomEvent({ type: "seek-by", seconds: 5 });
+          return;
+        case "n":
+          if (!host) return;
+          e.preventDefault();
+          void rest.playerAction("skip");
+          return;
+        case "m":
+          e.preventDefault();
+          emitRoomEvent({ type: "toggle-mute" });
+          return;
+        case "/":
+          e.preventDefault();
+          rest.goDiscover();
+          emitRoomEvent({ type: "focus-search" });
+          return;
+        case "r":
+          // "I think I'm out of sync" — re-anchor the clock and snap the deck.
+          e.preventDefault();
+          emitRoomEvent({ type: "force-resync" });
+          void refreshRef.current();
+          return;
+        default:
+          return;
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const visibleReactions = [
+    ...localReactions,
+    ...(snap?.reactions ?? []).filter((r) => r.userId !== me.id),
+  ];
 
   return (
     <main className="grain relative flex h-dvh flex-col overflow-hidden">
       <Aurora live={!!playing} />
+
+      {/* ---------- connection banner ----------
+           Polling errors used to be swallowed in silence, so a dead link
+           looked exactly like a quiet room. */}
+      {conn !== "online" && (
+        <div className="pointer-events-none fixed inset-x-0 top-[4.2rem] z-50 flex justify-center px-3">
+          <div
+            role="status"
+            aria-live="polite"
+            className="pointer-events-auto flex items-center gap-2 rounded-full border border-amber-300/25 bg-[#17120a]/92 px-4 py-2 text-[11px] font-semibold text-amber-200 shadow-[0_12px_40px_rgba(0,0,0,0.55)] backdrop-blur-xl"
+          >
+            {conn === "offline" ? (
+              <>
+                <WifiOff className="h-3.5 w-3.5" />
+                You are offline. The song keeps playing — the room will catch
+                up the moment you are back.
+              </>
+            ) : (
+              <>
+                <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                Reconnecting to the room…
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* ---------- header ---------- */}
       <header className="z-40 shrink-0 border-b border-white/5 bg-[#050509]/70 backdrop-blur-xl">
@@ -365,11 +690,12 @@ export default function PartyShell({
                 onClick={() => {
                   setRightTab("chat");
                   setTab("chat");
+                  setUnreadChat(0);
                 }}
                 icon={<MessageSquare className="h-4 w-4" />}
                 label="Chat"
-                dot={unreadChat > 0}
-                dotCount={unreadChat}
+                dot={unreadBadge > 0}
+                dotCount={unreadBadge}
               />
             </div>
             <div className="min-h-0 flex-1 overflow-hidden">
@@ -430,10 +756,11 @@ export default function PartyShell({
             onClick={() => {
               setTab("chat");
               setRightTab("chat");
+              setUnreadChat(0);
             }}
             icon={<MessageSquare className="h-4.5 w-4.5" />}
             label="Chat"
-            badge={unreadChat}
+            badge={unreadBadge}
             accent
           />
         </div>
@@ -457,6 +784,10 @@ export default function PartyShell({
       {!snap?.party.isOpen && snap && isAdmin && (
         <ReopenBanner onOpen={() => adminAction("openParty")} />
       )}
+
+      {/* ---------- reactions ---------- */}
+      <FloatingReactions reactions={visibleReactions} />
+      <ReactionBar onReact={sendReaction} />
     </main>
   );
 }

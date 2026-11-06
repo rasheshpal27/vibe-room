@@ -363,7 +363,10 @@ test('the room poll is quiet: bounded payload, throttled heartbeat, no overlap, 
   const shellCode = fs.readFileSync('src/components/PartyShell.tsx', 'utf8');
   assert.ok(shellCode.includes('inFlightRef'), 'one state request at a time');
   assert.ok(shellCode.includes('AbortSignal.timeout(POLL_TIMEOUT_MS)'), 'a hung poll cannot wedge the loop');
-  assert.ok(shellCode.includes('if (!document.hidden) refresh()'), 'a background tab stops polling');
+  assert.ok(shellCode.includes('nextPollDelayMs') && shellCode.includes('hidden: isHidden()'),
+    'a background tab polls slowly rather than stopping: the audio keeps playing');
+  assert.ok(shellCode.includes('createTicker'),
+    'the poll loop runs on a worker ticker so a hidden tab is not clamped to 1/minute');
   assert.ok(shellCode.includes('visibilitychange') && shellCode.includes('"online"'),
     'coming back refreshes immediately instead of waiting out the interval');
   assert.ok(shellCode.includes('renderSignature'), 'identical snapshots do not re-render the room');
@@ -392,7 +395,9 @@ test('corrective seeks need two strikes and a cooldown so playback stops stutter
   assert.match(code, /SEEK_TOLERANCE_SEC = 0\.3/);
   assert.match(code, /SEEK_STRIKES_BEFORE_SEEK = 2/);
   assert.match(code, /SEEK_COOLDOWN_MS = 2000/);
-  assert.ok(code.includes('driftStrikesRef.current >= SEEK_STRIKES_BEFORE_SEEK'),
+  assert.ok(code.includes('planDriftCorrection') && code.includes('strikes: driftStrikesRef.current'),
+    'the strike ladder lives in one pure, tested function');
+  assert.ok(code.includes('strikesNeeded: SEEK_STRIKES_BEFORE_SEEK'),
     'a single noisy sample never triggers a seek');
   assert.ok(code.includes('PLAY_NUDGE_COOLDOWN_MS'), 'play() nudges are rate limited');
 });

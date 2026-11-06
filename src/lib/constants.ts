@@ -1,9 +1,11 @@
 import type { SongResult } from "./types";
 
-export const PARTY_PASSWORD =
-  process.env.PARTY_PASSWORD ?? "hirashesh";
-export const ADMIN_PASSWORD =
-  process.env.ADMIN_PASSWORD ?? "adminrasheshadmin";
+/*
+ * Passwords used to live here with committed defaults. They now live in
+ * src/lib/env.ts, which has no fallbacks and is never imported by a client
+ * component — this module is, so anything in it ends up in the browser
+ * bundle for anyone to read.
+ */
 
 export const AVATAR_COLORS = [
   "#a78bfa",

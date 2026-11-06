@@ -22,6 +22,26 @@ import { buildSongSuggestions } from "@/lib/suggestions";
 import { formatDuration, type PartySnapshot, type SongResult } from "@/lib/types";
 import type { JoinedUser } from "./EntryGate";
 
+/**
+ * Query string for /api/suggestions. Pure and exported so the panel can
+ * compare "the answer I have" against "the request I would make" to derive
+ * its loading state instead of flipping a flag inside an effect.
+ */
+export function buildSuggestionQuery(input: {
+  artist?: string | null;
+  title?: string | null;
+  exclude: Iterable<string>;
+  seed: number;
+}): string {
+  const params = new URLSearchParams();
+  if (input.artist) params.set("artist", input.artist);
+  if (input.title) params.set("title", input.title);
+  const exclude = Array.from(input.exclude);
+  if (exclude.length) params.set("exclude", exclude.join(","));
+  params.set("seed", String(input.seed));
+  return params.toString();
+}
+
 export default function QueuePanel({
   snap,
   me,
@@ -39,9 +59,12 @@ export default function QueuePanel({
 }) {
   const [busyId, setBusyId] = useState<number | null>(null);
   const [addedIds, setAddedIds] = useState<Set<string>>(new Set());
-  const [remoteSuggestions, setRemoteSuggestions] = useState<SongResult[]>([]);
+  /** Results plus the request they answered, so "loading" can be derived. */
+  const [remote, setRemote] = useState<{ key: string; items: SongResult[] }>({
+    key: "",
+    items: [],
+  });
   const [suggestionSeed, setSuggestionSeed] = useState(0);
-  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
   const [scrolledUpInHistory, setScrolledUpInHistory] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -57,40 +80,45 @@ export default function QueuePanel({
   // Exclude songs currently playing or already queued from suggestions
   const excludedVideoIds = useMemo(() => {
     const ids = new Set<string>();
-    if (nowPlaying?.videoId) ids.add(nowPlaying.videoId);
-    for (const q of queue) ids.add(q.videoId);
+    const current = snap?.nowPlaying?.videoId;
+    if (current) ids.add(current);
+    for (const q of snap?.queue ?? []) ids.add(q.videoId);
     return ids;
-  }, [nowPlaying?.videoId, queue]);
+  }, [snap?.nowPlaying?.videoId, snap?.queue]);
 
-  // Fetch contextual suggestions from /api/suggestions when current track changes or user refreshes
+  /* Contextual suggestions for whatever is on the deck.
+     The spinner is *derived* — "the answer I have does not match the request
+     I would make" — rather than flipped by a setState at the top of the
+     effect, which cascades a render of the whole panel on every track. */
+  const suggestionQuery = buildSuggestionQuery({
+    artist: nowPlaying?.artist,
+    title: nowPlaying?.title,
+    exclude: excludedVideoIds,
+    seed: suggestionSeed,
+  });
+
+  const loadingSuggestions = remote.key !== suggestionQuery;
+
   useEffect(() => {
     let cancelled = false;
-    setLoadingSuggestions(true);
-    const params = new URLSearchParams();
-    if (nowPlaying?.artist) params.set("artist", nowPlaying.artist);
-    if (nowPlaying?.title) params.set("title", nowPlaying.title);
-    const excludeArr = Array.from(excludedVideoIds);
-    if (excludeArr.length) params.set("exclude", excludeArr.join(","));
-
-    fetch(`/api/suggestions?${params.toString()}`, { cache: "no-store" })
+    fetch(`/api/suggestions?${suggestionQuery}`, { cache: "no-store" })
       .then((r) => (r.ok ? r.json() : { suggestions: [] }))
       .then((data) => {
         if (cancelled) return;
-        if (Array.isArray(data.suggestions)) {
-          setRemoteSuggestions(data.suggestions);
-        }
+        setRemote({
+          key: suggestionQuery,
+          items: Array.isArray(data.suggestions) ? data.suggestions : [],
+        });
       })
       .catch(() => {
-        /* fallback to curated suggestions */
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingSuggestions(false);
+        // Curated fallback below covers this.
+        if (!cancelled) setRemote({ key: suggestionQuery, items: [] });
       });
 
     return () => {
       cancelled = true;
     };
-  }, [nowPlaying?.videoId, nowPlaying?.artist, nowPlaying?.title, suggestionSeed, excludedVideoIds]);
+  }, [suggestionQuery]);
 
   const suggestions = useMemo(() => {
     const rotatedCurated = [
@@ -98,11 +126,11 @@ export default function QueuePanel({
       ...SUGGESTED_SONGS.slice(0, suggestionSeed % SUGGESTED_SONGS.length),
     ];
     return buildSongSuggestions(
-      [...remoteSuggestions, ...rotatedCurated],
+      [...remote.items, ...rotatedCurated],
       excludedVideoIds,
       5
     );
-  }, [remoteSuggestions, suggestionSeed, excludedVideoIds]);
+  }, [remote.items, suggestionSeed, excludedVideoIds]);
 
   // Anchor scroll position at the active/upcoming section so played songs sit
   // above and the user can scroll up to inspect played history.

@@ -183,3 +183,130 @@ visible to everyone — it is the only escape hatch when a browser blocks audio.
 | Every poll re-rendered the room even when nothing changed | `renderSignature()` ignores `serverNow`/heartbeat timestamps; identical snapshots skip `setState` entirely. `SearchPanel`/`ChatPanel` are memoised |
 | A full-screen film-grain layer animated 4 steps/0.9s forever | the grain is now static, and `prefers-reduced-motion` disables the aurora, spin, pulse and marquee |
 | `setUnreadChat` ran inside the `setSnap` updater (impure, double-fires in StrictMode) | unread counting moved out of the updater and is suppressed for the first snapshot |
+
+---
+
+# Round 6 — secrets, reconnects, soft drift, and the room's colour
+
+## Security and configuration
+
+| Problem found | Fix |
+| --- | --- |
+| `src/lib/constants.ts` held `process.env.PARTY_PASSWORD ?? "hirashesh"` and an admin equivalent. The module is imported by client components, so **both fallback passwords were bundled into the browser JavaScript** — the repo was the key to the room | `src/lib/env.ts` is server-only and has no defaults. Missing secrets fail closed: a boot-time `console.error`, `authConfigured()` false, and every auth path answers `503 not-configured` with a message naming the missing variables |
+| Passwords were compared with `===`, which returns early on the first differing byte | `secretEquals()` hashes both sides with SHA-256 and compares with `timingSafeEqual`. Hashing first keeps the buffers equal-length, so neither the value nor its *length* leaks |
+| Nothing stopped a script from trying ten thousand passwords, or flooding chat | `src/lib/rate-limit.ts`: a pure token bucket (`takeToken`) plus a keyed in-memory store. Auth 8 then 1/7.5s, chat 12 then 1/s, reactions 15 then 1.5/s, queue 20 then 1/2s, all per client IP taken from the first `x-forwarded-for` hop. Denials return `429` with `Retry-After` |
+| `env.ts` must not throw at import time, or `next build` dies on a machine without secrets | it only logs; the 503 is produced per request |
+
+## Reconnects and hidden tabs
+
+| Problem found | Fix |
+| --- | --- |
+| A background tab stopped polling entirely, but **YouTube kept playing** — so a phone in a pocket drifted for minutes and snapped on return | hidden tabs poll every 6 s instead of every 1 s (`POLL_MS_HIDDEN`). The loop runs on a Web Worker timer (`src/lib/ticker.ts`) because browsers clamp `setInterval` to once a minute in background pages |
+| One dropped poll looked identical to a dead connection | `connectionStatus()` needs two consecutive failures before the "reconnecting" banner appears; `navigator.onLine === false` shows "offline" immediately |
+| A flaky link produced a tight retry loop against an already-struggling server | exponential backoff 1 s → 20 s with ±25% jitter (`nextPollDelayMs`), floored at the current visibility's poll interval |
+| Coming back from a gap, the deck drifted in slowly from a stale anchor | `shouldForceResyncOnRecovery()` — after ≥2 failures or ≥4 s without a confirmed snapshot, the first good poll triggers a 3-sample clock burst and a hard seek |
+| Every poll already carried `serverNow`, and it was thrown away | each poll is now a free RTT sample into the shared clock store, so the anchor stays fresh between bursts and a reconnect re-converges almost immediately |
+
+## One clock for the whole page
+
+`src/lib/clock-store.ts` replaces the per-component sample arrays. It keeps the
+twelve most recent samples, anchors on the lowest RTT, drops anything slower
+than 4 s, and publishes to subscribers. `seedClockFromServerNow()` gives a fresh
+tab a coarse anchor from the first snapshot but refuses to overwrite a measured
+one.
+
+## Soft drift correction
+
+A seek is audible; a 3% speed change is not. `planDriftCorrection()` in
+`src/lib/playback.ts` is a pure function over `{driftSec, currentRate, strikes,
+seekCooledDown, force, rateSupported}`:
+
+- inside the deadband → do nothing;
+- outside it → steer at `0.97x` (ahead) or `1.03x` (behind), and *say nothing*
+  if the deck is already steering the right way;
+- back within `DRIFT_SETTLED_SEC` (0.12 s) → hand the deck back to `1.0x`;
+- far out, after two strikes and a cooldown → seek.
+
+`setPlaybackRate` is advisory in the IFrame API: values outside
+`getAvailablePlaybackRates()` are ignored, and the bridge is async. The deck
+therefore records the rate it asked for and re-reads it ~900 ms later; on a
+mismatch it sets `rateSupported = false` and falls back to the seek ladder for
+the rest of the session.
+
+## Transport hygiene
+
+`POST /api/player` is now fired through `postJson()` (`src/lib/net.ts`), which
+adds an 8 s timeout and a single 700 ms retry — but **only** for the three
+idempotent reports (`ended`, `duration`, `unplayable`). Retrying `skip` or
+`toggle` would skip two songs or undo the host's own click. `429` is never
+retried: backing off is the entire point of the response.
+
+## Features
+
+- **Paste any YouTube link.** `parseYouTubeTarget()` understands `watch`,
+  `youtu.be`, `shorts`, `embed`, `music.`, bare 11-character ids and playlist
+  URLs, and carries `t=90` / `t=1m30s` / `t=1h2m3s` start offsets through. The
+  search route resolves a pasted id via oEmbed (no API key needed) and scrapes
+  up to 12 entries from a playlist page.
+- **Floating reactions.** Six emoji, stored as `chatMessages.kind = "reaction"`
+  so they survive a reload, returned in a 9-second window capped at 24 rows, and
+  laid out with golden-ratio lane hashing so a burst of the same emoji does not
+  stack in one column. The sender's own reactions are filtered out of the
+  snapshot (`r.userId !== me.id`) because they already rendered locally.
+- **Media Session.** Lock-screen artwork, title and position. For the host the
+  controls drive the room (play, pause, seek, next); for guests play/pause is
+  mapped to **local mute**, so a headphone button cannot pause the party for
+  everybody else.
+- **Per-track theming.** `src/lib/palette.ts` samples the artwork in a 36×36
+  canvas, buckets the pixels, discards crushed blacks, blown highlights and grey
+  chrome, and weights saturated mid-tones. The winner is normalised to something
+  readable on near-black and pushed onto `<html>` as `--vibe-accent`,
+  `--vibe-accent-2` and `--vibe-glow`, which `Aurora.tsx` and the room's
+  gradients read. A grey thumbnail returns `null` and the house palette stays.
+  Note: CSS cannot transition between two `background-image` values, so the
+  colour change lands on the next paint rather than crossfading.
+- **Keyboard shortcuts** — `space`/`k`, `n`, `←`/`→` (host only), `m`, `/`, `r`.
+  Dispatched as `CustomEvent`s through `src/lib/room-events.ts` so the shell can
+  talk to the deck without threading props or lifting state.
+
+## React Compiler lint: 12 errors → 0
+
+The round-5 baseline was 12 errors. All are now fixed, and no rule was disabled
+to get there.
+
+| Rule | Where | Fix |
+| --- | --- | --- |
+| `react-hooks/purity` ×2 | `NowPlaying` | `Date.now()` / `performance.now()` ran inside a `useRef` initializer. The clock moved into the shared store, so nothing reads a wall clock during render |
+| `react-hooks/refs` ×2 | `PartyShell` | `ref.current = …` during render → mirrored in a `useEffect` instead |
+| `react-hooks/set-state-in-effect` ×2 | `PartyShell` | `adminKey` is now a lazy `useState` initializer reading `localStorage` behind a `typeof window` guard; the unread-chat reset became derived state plus an explicit reset in the two buttons that open chat |
+| `react-hooks/set-state-in-effect` ×1 | `SearchPanel` | clearing results moved out of the debounce effect into the `onChange` handler, where the user's intent actually is |
+| `react-hooks/set-state-in-effect` ×2 | `QueuePanel`, `LyricsOverlay` | **the interesting ones.** Both were `setLoading(true)` at the top of a fetch-on-prop-change effect. Rewritten so the fetch result is stored *together with the request it answers* (`{key, data}`), and `loading` is derived as `result.key !== currentQuery`. No flag, no cascade, and a stale response can no longer overwrite a newer one |
+| `react-hooks/set-state-in-effect` ×3 | `NowPlaying`, `QueuePanel` | effects that called `sync()` or rebuilt a memo from a snapshot — deferred to the next macrotask, or rewritten to read the snapshot fields the memo actually depends on |
+
+The two remaining warnings are pre-existing `exhaustive-deps` notes on
+intentionally-stable callbacks.
+
+## Repository basics
+
+`.env.example`, `README.md`, MIT `LICENSE`, committed Drizzle migrations in
+`drizzle/`, and `.github/workflows/ci.yml` running typecheck → lint → tests →
+build on every push and PR.
+
+## Tests
+
+`tests/sync-net-theme.test.cjs` adds 23 tests (53 total, all passing) covering
+the clock store's anchor selection and subscriptions, backoff and reconnect
+decisions, retry eligibility, every shape of pasted YouTube URL, reaction
+validation and lane spread, the token bucket and per-key isolation, fail-closed
+auth, HSL round-tripping, dominant-colour extraction, and the drift plan in all
+of its branches.
+
+## Not done
+
+Honest list: `NowPlaying.tsx` is still one very large component and was not
+split; there are no Playwright or k6 suites; there is no Sentry wiring or
+`/api/client-error` route; beat-reactive visuals, Auto-DJ, PWA installability,
+chat threading and mood themes remain in the backlog. None of the UI changes in
+this round could be verified in a browser from the build environment — there is
+no Postgres and no display — so everything above is covered by unit tests over
+pure functions and by source assertions, not by a runtime check.

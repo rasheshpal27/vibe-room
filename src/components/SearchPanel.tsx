@@ -1,6 +1,7 @@
 "use client";
 
 import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { onRoomEvent } from "@/lib/room-events";
 import {
   Search,
   Plus,
@@ -54,6 +55,18 @@ function SearchPanel({
   const [suggestionSeed, setSuggestionSeed] = useState(0);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const seqRef = useRef(0);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  // "/" anywhere in the room jumps here and puts the cursor in the box.
+  useEffect(() => {
+    return onRoomEvent((event) => {
+      if (event.type !== "focus-search") return;
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      el.select();
+    });
+  }, []);
 
   const quickSuggestions = useMemo(() => {
     const rotated = [
@@ -84,22 +97,29 @@ function SearchPanel({
     }
   };
 
-  useEffect(() => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    const q = query.trim();
-    if (!q) {
-      if (!activeMood) {
-        setResults([]);
-        setError("");
-      }
+  /**
+   * Typing is an event, not a synchronisation problem: clearing the results
+   * and dropping the active mood belong in the handler, which leaves the
+   * effect to do nothing but schedule the debounced request.
+   */
+  const changeQuery = (next: string) => {
+    setQuery(next);
+    if (!next.trim()) {
+      setResults([]);
+      setError("");
       return;
     }
     setActiveMood(null);
+  };
+
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    const q = query.trim();
+    if (!q) return;
     debounceRef.current = setTimeout(() => runSearch(q), 300);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query]);
 
   const pickMood = (mood: Mood) => {
@@ -150,14 +170,15 @@ function SearchPanel({
         <div className="group relative">
           <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500 transition group-focus-within:text-fuchsia-300" />
           <input
+            ref={inputRef}
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search any song, artist, vibe…"
+            onChange={(e) => changeQuery(e.target.value)}
+            placeholder="Search a song, or paste a YouTube link…"
             className="w-full rounded-2xl border border-white/10 bg-black/40 py-3 pl-11 pr-10 text-sm text-white outline-none transition placeholder:text-zinc-600 focus:border-fuchsia-400/50 focus:shadow-[0_0_26px_rgba(217,70,239,0.18)]"
           />
           {query && (
             <button
-              onClick={() => setQuery("")}
+              onClick={() => changeQuery("")}
               className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full p-1 text-zinc-500 hover:bg-white/10 hover:text-white"
             >
               <X className="h-3.5 w-3.5" />

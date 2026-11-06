@@ -1,5 +1,15 @@
 @import "tailwindcss";
 
+/* Room accent channels, as bare "R G B" triples so they can be used with an
+   alpha: rgb(var(--vibe-accent) / 0.35). applyRoomTheme() in src/lib/palette.ts
+   overwrites these on <html> with colours sampled from the current artwork;
+   these are the violet/fuchsia/cyan house defaults it falls back to. */
+:root {
+  --vibe-accent: 167 139 250;
+  --vibe-accent-2: 232 121 249;
+  --vibe-glow: 34 211 238;
+}
+
 @theme {
   --font-display: var(--font-unbounded), "Arial Black", sans-serif;
   --font-body: var(--font-space), system-ui, sans-serif;
@@ -140,6 +150,21 @@ button, a, [role="button"] {
   .row-actions:focus-within {
     opacity: 1;
   }
+}
+
+/* floating reactions */
+@keyframes reaction-rise {
+  0%   { transform: translateY(0) scale(0.6); opacity: 0; }
+  12%  { transform: translateY(-14px) scale(1.15); opacity: 1; }
+  70%  { opacity: 1; }
+  100% { transform: translateY(-46vh) scale(0.95) rotate(var(--spin, 8deg)); opacity: 0; }
+}
+.reaction-float {
+  animation: reaction-rise 4.2s cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+  will-change: transform, opacity;
+}
+@media (prefers-reduced-motion: reduce) {
+  .reaction-float { animation-duration: 2.2s; }
 }
 
 /* vinyl record */

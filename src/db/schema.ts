@@ -73,7 +73,13 @@ export const chatMessages = pgTable("chat_messages", {
   userName: text("user_name").notNull().default("Guest"),
   userColor: text("user_color").notNull().default("#a78bfa"),
   isAdmin: boolean("is_admin").notNull().default(false),
-  /** text | gif | system */
+  /**
+   * text    — a normal chat line
+   * gif     — `content` is an image URL rendered inline
+   * system  — joins, skips, host announcements
+   * reaction — a floating emoji burst; written here so it survives a reload,
+   *            and filtered out of the chat transcript by /api/state.
+   */
   kind: text("kind").notNull().default("text"),
   content: text("content").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true })
