@@ -2,28 +2,39 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { users } from "@/db/schema";
 import { eq } from "drizzle-orm";
-import { ADMIN_PASSWORD, AVATAR_COLORS, PARTY_PASSWORD } from "@/lib/constants";
-import { ensureState, isAdminKey, systemMessage } from "@/lib/party";
+import { AVATAR_COLORS } from "@/lib/constants";
+import {
+  authConfigured,
+  configErrorPayload,
+  verifyAdminPassword,
+  verifyPartyPassword,
+} from "@/lib/env";
+import { limitKey, rateLimit, RULES } from "@/lib/rate-limit";
+import { ensureState, systemMessage } from "@/lib/party";
 
 export const dynamic = "force-dynamic";
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function tooMany(retryAfterSec: number) {
+  return NextResponse.json(
+    {
+      ok: false,
+      error: `Too many attempts. Try again in ${retryAfterSec}s.`,
+    },
+    { status: 429, headers: { "Retry-After": String(retryAfterSec) } }
+  );
+}
 
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({}));
   const action = String(body.action ?? "join");
 
-  if (action === "admin") {
-    // Verify host password
-    if (isAdminKey(body.password)) return NextResponse.json({ ok: true });
-    return NextResponse.json(
-      { ok: false, error: "Wrong host password." },
-      { status: 401 }
-    );
-  }
-
+  // Leaving is not a credential check and must never be rate limited away:
+  // a blocked "leave" leaves a ghost in the room for 90 seconds.
   if (action === "leave") {
     const userId = String(body.userId ?? "");
-    const UUID_RE =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (UUID_RE.test(userId)) {
       const found = await db.select().from(users).where(eq(users.id, userId));
       if (found.length) {
@@ -34,16 +45,34 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true });
   }
 
+  // No secrets configured → no way in. Fail closed, never fall back to a
+  // built-in password.
+  if (!authConfigured()) {
+    return NextResponse.json(configErrorPayload(), { status: 503 });
+  }
+
+  // Password guessing is the one thing worth throttling hard.
+  const verdict = rateLimit(limitKey("auth", req.headers), RULES.auth);
+  if (!verdict.allowed) return tooMany(verdict.retryAfterSec);
+
+  if (action === "admin") {
+    if (verifyAdminPassword(body.password)) {
+      return NextResponse.json({ ok: true });
+    }
+    return NextResponse.json(
+      { ok: false, error: "Wrong host password." },
+      { status: 401 }
+    );
+  }
+
   // --- join ---
-  const password = String(body.password ?? "");
-  const adminPassword = String(body.adminPassword ?? "");
   const name = String(body.name ?? "").trim().slice(0, 24);
-  const asAdmin = isAdminKey(adminPassword);
+  const asAdmin = verifyAdminPassword(body.adminPassword);
 
   const state = await ensureState();
 
   if (!asAdmin) {
-    if (password !== PARTY_PASSWORD) {
+    if (!verifyPartyPassword(body.password)) {
       return NextResponse.json(
         { ok: false, error: "Wrong password. Ask the host for the vibe code." },
         { status: 401 }

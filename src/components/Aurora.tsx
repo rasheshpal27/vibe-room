@@ -1,5 +1,14 @@
 "use client";
 
+/**
+ * The room's background. Every gradient is written against the --vibe-*
+ * channels, which src/lib/palette.ts repaints from the current track's
+ * artwork — so the whole room takes on the colour of the album cover.
+ *
+ * Note: CSS cannot transition between two background-image values, so the
+ * colour change lands on the next paint rather than crossfading. Adding a
+ * `transition: background` here does nothing.
+ */
 export default function Aurora({ live = false }: { live?: boolean }) {
   return (
     <div className="pointer-events-none fixed inset-0 overflow-hidden" aria-hidden>
@@ -12,28 +21,28 @@ export default function Aurora({ live = false }: { live?: boolean }) {
         style={{
           animationDuration: live ? "18s" : "34s",
           background:
-            "conic-gradient(from 40deg at 50% 50%, transparent 0deg, rgba(124,58,237,0.16) 70deg, transparent 140deg, rgba(219,39,119,0.13) 210deg, transparent 280deg, rgba(34,211,238,0.10) 330deg, transparent 360deg)",
+            "conic-gradient(from 40deg at 50% 50%, transparent 0deg, rgb(var(--vibe-accent) / 0.16) 70deg, transparent 140deg, rgb(var(--vibe-accent-2) / 0.13) 210deg, transparent 280deg, rgb(var(--vibe-glow) / 0.10) 330deg, transparent 360deg)",
           filter: "blur(60px)",
         }}
       />
       <div
         className="absolute -left-[20%] top-[-30%] h-[70vmax] w-[70vmax] rounded-full opacity-40"
         style={{
-          background: "radial-gradient(circle, rgba(124,58,237,0.35), transparent 62%)",
+          background: "radial-gradient(circle, rgb(var(--vibe-accent) / 0.35), transparent 62%)",
           filter: "blur(70px)",
         }}
       />
       <div
         className="absolute -right-[25%] bottom-[-35%] h-[80vmax] w-[80vmax] rounded-full opacity-35"
         style={{
-          background: "radial-gradient(circle, rgba(219,39,119,0.32), transparent 62%)",
+          background: "radial-gradient(circle, rgb(var(--vibe-accent-2) / 0.32), transparent 62%)",
           filter: "blur(80px)",
         }}
       />
       <div
         className="absolute bottom-[-20%] left-[10%] h-[50vmax] w-[50vmax] rounded-full opacity-25"
         style={{
-          background: "radial-gradient(circle, rgba(34,211,238,0.3), transparent 62%)",
+          background: "radial-gradient(circle, rgb(var(--vibe-glow) / 0.3), transparent 62%)",
           filter: "blur(80px)",
         }}
       />

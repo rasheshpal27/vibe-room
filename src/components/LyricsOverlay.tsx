@@ -54,6 +54,29 @@ function lineIndexAt(lines: LyricLine[], seconds: number): number {
  * The playhead arrives through a subscription instead of a prop so the deck
  * can publish it many times a second without re-rendering the whole party.
  */
+/**
+ * Query string for /api/lyrics. `attempt` only exists to make the string
+ * change when the user asks for a retry — the server ignores it.
+ */
+export function buildLyricsQuery(input: {
+  title: string;
+  artist?: string;
+  durationSec?: number;
+  alt: number;
+  attempt: number;
+}): string {
+  const params = new URLSearchParams({
+    title: input.title,
+    artist: input.artist ?? "",
+  });
+  if (input.durationSec && input.durationSec > 0) {
+    params.set("duration", String(Math.round(input.durationSec)));
+  }
+  if (input.alt > 0) params.set("alt", String(input.alt));
+  if (input.attempt > 0) params.set("retry", String(input.attempt));
+  return params.toString();
+}
+
 export default function LyricsOverlay({
   title,
   artist,
@@ -66,44 +89,52 @@ export default function LyricsOverlay({
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef<HTMLParagraphElement>(null);
-  const [data, setData] = useState<Lyrics | null>(null);
-  const [status, setStatus] = useState<"idle" | "loading" | "done" | "error">(
-    title ? "loading" : "idle"
-  );
+  /* The fetch result is stored together with the request it answers, so
+     "loading" is derived — `the answer I hold is not for the question I am
+     asking`. Flipping a status flag at the top of the effect instead would
+     cascade a render of the panel on every track change. */
+  const [result, setResult] = useState<{
+    key: string;
+    data: Lyrics | null;
+    failed: boolean;
+  }>({ key: "", data: null, failed: false });
   const [attempt, setAttempt] = useState(0);
   const [alt, setAlt] = useState(0);
   const [pad, setPad] = useState(96);
   const [index, setIndex] = useState(-1);
 
-  useEffect(() => {
-    if (!title) {
-      setData(null);
-      setStatus("idle");
-      return;
-    }
-    const controller = new AbortController();
-    setStatus("loading");
-    const params = new URLSearchParams({ title, artist: artist ?? "" });
-    if (durationSec && durationSec > 0) {
-      params.set("duration", String(Math.round(durationSec)));
-    }
-    if (alt > 0) params.set("alt", String(alt));
+  const query = title
+    ? buildLyricsQuery({ title, artist, durationSec, alt, attempt })
+    : "";
 
-    fetch(`/api/lyrics?${params}`, { signal: controller.signal })
+  const data = result.key === query ? result.data : null;
+  const status: "idle" | "loading" | "done" | "error" = !title
+    ? "idle"
+    : result.key !== query
+      ? "loading"
+      : result.failed
+        ? "error"
+        : "done";
+
+  useEffect(() => {
+    if (!query) return;
+    const controller = new AbortController();
+    fetch(`/api/lyrics?${query}`, { signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) throw new Error("Unavailable");
         return response.json() as Promise<Lyrics>;
       })
       .then((lyrics) => {
         if (controller.signal.aborted) return;
-        setData(lyrics);
-        setStatus("done");
+        setResult({ key: query, data: lyrics, failed: false });
       })
       .catch(() => {
-        if (!controller.signal.aborted) setStatus("error");
+        if (!controller.signal.aborted) {
+          setResult({ key: query, data: null, failed: true });
+        }
       });
     return () => controller.abort();
-  }, [title, artist, durationSec, attempt, alt]);
+  }, [query]);
 
   const lines = useMemo(
     () => parseLyrics(data?.syncedLyrics ?? ""),
@@ -208,10 +239,7 @@ export default function LyricsOverlay({
           {title && status !== "loading" && (
             <button
               type="button"
-              onClick={() => {
-                setStatus("loading");
-                setAttempt((n) => n + 1);
-              }}
+              onClick={() => setAttempt((n) => n + 1)}
               title="Reload lyrics"
               className="flex h-8 w-8 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-zinc-400 backdrop-blur-sm transition hover:bg-white/10 hover:text-white"
             >
@@ -303,10 +331,7 @@ export default function LyricsOverlay({
               <button
                 type="button"
                 className="rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-xs font-semibold text-zinc-200 transition hover:bg-white/10"
-                onClick={() => {
-                  setStatus("loading");
-                  setAttempt((n) => n + 1);
-                }}
+                onClick={() => setAttempt((n) => n + 1)}
               >
                 Try again
               </button>

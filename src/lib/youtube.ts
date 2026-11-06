@@ -229,3 +229,102 @@ export async function searchSongs(q: string): Promise<SongResult[]> {
   cache.set(key, { at: Date.now(), data: results });
   return results;
 }
+
+/* ------------------------------------------------------------------ *
+ * Pasted links
+ *
+ * Search is useless when somebody already has the exact URL. oEmbed
+ * resolves a video id to a real title/author with no API key and no
+ * quota; duration is not part of oEmbed, so it comes back as 0 and the
+ * deck's existing duration self-repair fixes it a few seconds into
+ * playback. Playlists are read from the public watch page, which still
+ * embeds its data as JSON.
+ * ------------------------------------------------------------------ */
+
+/** Resolve one video id into a queueable song via YouTube's oEmbed endpoint. */
+export async function resolveVideoId(videoId: string): Promise<SongResult | null> {
+  if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) return null;
+
+  const oembed = `https://www.youtube.com/oembed?url=${encodeURIComponent(
+    `https://www.youtube.com/watch?v=${videoId}`
+  )}&format=json`;
+
+  try {
+    const data = (await fetchWithTimeout(oembed, 6000)) as {
+      title?: string;
+      author_name?: string;
+      thumbnail_url?: string;
+    };
+    const rawTitle = String(data.title ?? "").trim();
+    if (!rawTitle) return null;
+    const author = String(data.author_name ?? "").replace(/\s*-\s*Topic$/i, "");
+    const cleaned = cleanTitle(rawTitle);
+    const { artist, title } = splitArtist(cleaned, author || "YouTube");
+    return {
+      videoId,
+      title: title || cleaned || rawTitle,
+      artist,
+      // oEmbed hands back an hqdefault URL; keep our canonical one.
+      thumbnail: ytThumb(videoId),
+      durationSec: 0,
+    };
+  } catch {
+    // Unlisted/age-gated videos have no oEmbed entry. They may still play,
+    // so offer the raw id rather than refusing the paste.
+    return {
+      videoId,
+      title: `YouTube video ${videoId}`,
+      artist: "Pasted link",
+      thumbnail: ytThumb(videoId),
+      durationSec: 0,
+    };
+  }
+}
+
+const PLAYLIST_ID_RE = /"videoId":"([A-Za-z0-9_-]{11})"/g;
+
+/** Pull the first video ids out of a public playlist page. */
+export async function resolvePlaylist(
+  listId: string,
+  max = 12
+): Promise<SongResult[]> {
+  if (!/^[A-Za-z0-9_-]{12,48}$/.test(listId)) return [];
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 7000);
+  let html = "";
+  try {
+    const res = await fetch(
+      `https://www.youtube.com/playlist?list=${encodeURIComponent(listId)}&hl=en`,
+      {
+        signal: ctl.signal,
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+        cache: "no-store",
+      }
+    );
+    if (!res.ok) return [];
+    html = await res.text();
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const match of html.matchAll(PLAYLIST_ID_RE)) {
+    const id = match[1];
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= max) break;
+  }
+  if (!ids.length) return [];
+
+  const resolved = await Promise.all(ids.map((id) => resolveVideoId(id)));
+  return resolved.filter((r): r is SongResult => r !== null);
+}

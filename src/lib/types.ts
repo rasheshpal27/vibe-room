@@ -32,6 +32,16 @@ export interface ChatMessageDTO {
   createdAt: string;
 }
 
+/** A floating reaction: a chat row of kind "reaction", lifted out of the log. */
+export interface ReactionDTO {
+  id: number;
+  userId: string | null;
+  emoji: string;
+  userName: string;
+  userColor: string;
+  atMs: number;
+}
+
 export interface PartySnapshot {
   serverNow: number; // UTC ms epoch
   party: {
@@ -56,7 +66,18 @@ export interface PartySnapshot {
   /** Previously played songs in this party session (status === "done"), ordered chronologically */
   history: QueueItemDTO[];
   users: UserDTO[];
+  /**
+   * Chat log. When the request carried `chatSince` this holds only the rows
+   * newer than that id (see `chatDelta`) — a busy room should not re-send
+   * sixty messages every second.
+   */
   chat: ChatMessageDTO[];
+  /** True when `chat` is an increment rather than the full window. */
+  chatDelta: boolean;
+  /** Highest chat id on the server; lower than the client's means it was cleared. */
+  chatMaxId: number;
+  /** Reactions from the last few seconds, for the floating overlay. */
+  reactions: ReactionDTO[];
   you: UserDTO | null;
 }
 

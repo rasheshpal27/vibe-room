@@ -1,11 +1,13 @@
 import { db } from "@/db";
 import { chatMessages, partyState, queueItems, users } from "@/db/schema";
-import { and, asc, desc, eq, lt, sql } from "drizzle-orm";
-import { ADMIN_PASSWORD } from "./constants";
+import { and, asc, desc, eq, gt, lt, ne, sql } from "drizzle-orm";
+import { verifyAdminPassword } from "./env";
+import { REACTION_MAX_ROWS, REACTION_WINDOW_MS } from "./reactions";
 import type {
   ChatMessageDTO,
   PartySnapshot,
   QueueItemDTO,
+  ReactionDTO,
   UserDTO,
 } from "./types";
 
@@ -36,8 +38,12 @@ export async function ensureState() {
   return again[0];
 }
 
+/**
+ * Host check. Constant-time, and false whenever ADMIN_PASSWORD is unset —
+ * an unconfigured deployment has no host, it does not have a free one.
+ */
 export function isAdminKey(key: string | null | undefined) {
-  return !!key && key === ADMIN_PASSWORD;
+  return verifyAdminPassword(key);
 }
 
 export function elapsedSec(state: {
@@ -178,7 +184,19 @@ function toQueueItemDTO(q: typeof queueItems.$inferSelect): QueueItemDTO {
   };
 }
 
-export async function getSnapshot(youId?: string | null): Promise<PartySnapshot> {
+export interface SnapshotOptions {
+  /**
+   * Highest chat id the client already has. When present the chat log comes
+   * back as an increment instead of the whole window — a chat-heavy room
+   * stops re-sending sixty messages on every one-second poll.
+   */
+  chatSince?: number | null;
+}
+
+export async function getSnapshot(
+  youId?: string | null,
+  options: SnapshotOptions = {}
+): Promise<PartySnapshot> {
   // Heartbeat. Guests poll once a second; writing `lastSeen` on every poll
   // is what turns a 10-person room into 10 writes/second. Only touch the row
   // when it is actually stale (online cutoff is 90s, so 20s is plenty).
@@ -207,9 +225,23 @@ export async function getSnapshot(youId?: string | null): Promise<PartySnapshot>
     }
   }
 
+  const chatSince =
+    typeof options.chatSince === "number" && Number.isFinite(options.chatSince)
+      ? Math.max(0, Math.floor(options.chatSince))
+      : null;
+  const chatDelta = chatSince !== null;
+
+  // Reactions share the chat table but never the chat log: they are ephemeral
+  // confetti, not conversation.
+  const notAReaction = ne(chatMessages.kind, "reaction");
+  const chatWhere = chatDelta
+    ? and(notAReaction, gt(chatMessages.id, chatSince))
+    : notAReaction;
+
   // Bounded reads: an all-night party must not grow the payload (or the
   // query cost) of a poll that every guest runs once a second.
-  const [queuedRows, historyRows, userRows, chatRows] = await Promise.all([
+  const [queuedRows, historyRows, userRows, chatRows, reactionRows, chatMaxRows] =
+    await Promise.all([
     db
       .select()
       .from(queueItems)
@@ -226,8 +258,26 @@ export async function getSnapshot(youId?: string | null): Promise<PartySnapshot>
     db
       .select()
       .from(chatMessages)
+      .where(chatWhere)
       .orderBy(desc(chatMessages.id))
       .limit(MAX_CHAT_ROWS),
+    db
+      .select()
+      .from(chatMessages)
+      .where(
+        and(
+          eq(chatMessages.kind, "reaction"),
+          gt(chatMessages.createdAt, new Date(Date.now() - REACTION_WINDOW_MS))
+        )
+      )
+      .orderBy(desc(chatMessages.id))
+      .limit(REACTION_MAX_ROWS),
+    db
+      .select({
+        maxId: sql<number>`coalesce(max(${chatMessages.id}), 0)`,
+      })
+      .from(chatMessages)
+      .where(notAReaction),
   ]);
 
   const onlineCutoff = Date.now() - 90 * 1000;
@@ -259,6 +309,17 @@ export async function getSnapshot(youId?: string | null): Promise<PartySnapshot>
     }))
     .reverse();
 
+  const reactionsDto: ReactionDTO[] = [...reactionRows]
+    .reverse()
+    .map((r) => ({
+      id: r.id,
+      userId: r.userId,
+      emoji: r.content,
+      userName: r.userName,
+      userColor: r.userColor,
+      atMs: new Date(r.createdAt).getTime(),
+    }));
+
   const you = youId
     ? usersDto.find((u) => u.id === youId) ?? null
     : null;
@@ -288,8 +349,34 @@ export async function getSnapshot(youId?: string | null): Promise<PartySnapshot>
     history: historyDto,
     users: usersDto,
     chat: chatDto,
+    chatDelta,
+    chatMaxId: Number(chatMaxRows[0]?.maxId ?? 0),
+    reactions: reactionsDto,
     you,
   };
+}
+
+/**
+ * Everything in a snapshot that a client would actually re-render for.
+ *
+ * `serverNow` and the heartbeat timestamps change on literally every poll,
+ * so hashing the raw body would never produce a repeat. This mirrors the
+ * client's own render signature and backs the ETag: an unchanged room
+ * answers 304 with no body at all.
+ */
+export function snapshotSignature(snap: PartySnapshot): string {
+  return JSON.stringify({
+    p: snap.party,
+    n: snap.nowPlaying,
+    q: snap.queue,
+    h: snap.history.map((x) => x.id),
+    u: snap.users.map((x) => `${x.id}:${x.name}:${x.isAdmin}:${x.color}`),
+    c: snap.chat.map((x) => x.id),
+    cd: snap.chatDelta,
+    cm: snap.chatMaxId,
+    r: snap.reactions.map((x) => x.id),
+    y: snap.you ? `${snap.you.id}:${snap.you.isAdmin}:${snap.you.color}` : null,
+  });
 }
 
 /** Danger zone: wipe all party data (admin "close party"). */

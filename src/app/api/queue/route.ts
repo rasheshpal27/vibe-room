@@ -9,6 +9,7 @@ import {
   isAdminKey,
   systemMessage,
 } from "@/lib/party";
+import { limitKey, rateLimit, RULES } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -31,6 +32,15 @@ export async function POST(req: NextRequest) {
   if (!UUID_RE.test(userId)) {
     return NextResponse.json({ ok: false, error: "Join the party first" }, { status: 401 });
   }
+
+  const verdict = rateLimit(limitKey("queue", req.headers, userId), RULES.queue);
+  if (!verdict.allowed) {
+    return NextResponse.json(
+      { ok: false, error: "Easy on the queue — give the room a second." },
+      { status: 429, headers: { "Retry-After": String(verdict.retryAfterSec) } }
+    );
+  }
+
   const found = await db.select().from(users).where(eq(users.id, userId));
   if (!found.length) {
     return NextResponse.json({ ok: false, error: "Join the party first" }, { status: 401 });

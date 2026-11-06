@@ -24,14 +24,7 @@ import {
   YT_STATE,
   type YTPlayer,
 } from "@/lib/yt-loader";
-import {
-  computeExpectedPosition,
-  createClockSample,
-  getWorldNowMs,
-  selectBestClockAnchor,
-  type ClockSample,
-  type ClockSyncState,
-} from "@/lib/clock";
+import { computeExpectedPosition, getWorldNowMs } from "@/lib/clock";
 import {
   classifyPlayerError,
   crossfadeGains,
@@ -40,10 +33,12 @@ import {
   shouldArmEarlyEnd,
   shouldHealStall,
   shouldRetryLoad,
+  planDriftCorrection,
   CROSSFADE_SEC,
   FADE_HOLD_MAX_MS,
   PRELOAD_LEAD_SEC,
   SKIP_FADE_MS,
+  RATE_NORMAL,
   type PlayerErrorKind,
 } from "@/lib/playback";
 import {
@@ -53,6 +48,20 @@ import {
   onAudioUnlock,
 } from "@/lib/audio-unlock";
 import { setPlayhead } from "@/lib/playhead";
+import {
+  addClockSample,
+  getClockState,
+  seedClockFromServerNow,
+  subscribeClock,
+} from "@/lib/clock-store";
+import { onRoomEvent } from "@/lib/room-events";
+import {
+  clearMediaSession,
+  setMediaSessionHandlers,
+  setMediaSessionPlaybackState,
+  setMediaSessionPosition,
+  setMediaSessionTrack,
+} from "@/lib/media-session";
 import { formatDuration, type PartySnapshot } from "@/lib/types";
 
 // Drift threshold against the shared world clock. Correcting below ~300ms is
@@ -147,16 +156,10 @@ export default function NowPlaying({
   const volumeRef = useRef(80);
   const soundAllowedRef = useRef(false);
 
-  /* ---------- world clock ---------- */
-  const clockSamplesRef = useRef<ClockSample[]>([]);
-  const clockStateRef = useRef<ClockSyncState>({
-    utcAtMonoZero:
-      Date.now() - (typeof performance !== "undefined" ? performance.now() : 0),
-    offsetMs: 0,
-    bestRttMs: Infinity,
-    sampleCount: 0,
-    synced: false,
-  });
+  /* ---------- world clock ----------
+     Shared with the room poller: every /api/state response carries the
+     server clock in a header, so those count as samples too and the anchor
+     stays fresh between bursts. */
   const [clockBadge, setClockBadge] = useState<{
     synced: boolean;
     rttMs: number;
@@ -191,6 +194,13 @@ export default function NowPlaying({
   const pendingSeekRef = useRef(false);
   const lastSeekAtRef = useRef(0);
   const driftStrikesRef = useRef(0);
+  /* ---------- drift steering (soft correction) ---------- */
+  /** Rate currently applied to the live deck. */
+  const playbackRateRef = useRef(RATE_NORMAL);
+  /** Cleared the first time the player refuses a fractional rate. */
+  const rateSupportedRef = useRef(true);
+  /** A rate we asked for but have not yet confirmed the player accepted. */
+  const pendingRateRef = useRef<{ rate: number; atMs: number } | null>(null);
   const lastNudgeAtRef = useRef(0);
   const reportedDurationRef = useRef<string | null>(null);
   const onPlayerActionRef = useRef(onPlayerAction);
@@ -214,16 +224,83 @@ export default function NowPlaying({
     setPlayerProblem(message);
   }, []);
 
+  /** Guarded like setProblem: never re-render for a value that is unchanged. */
+  const healingRef = useRef(false);
+  const setHealingState = useCallback((next: boolean) => {
+    if (healingRef.current === next) return;
+    healingRef.current = next;
+    setHealing(next);
+  }, []);
+
   const setLoadedKey = useCallback((key: string | null) => {
     if (loadedTrackKeyRef.current === key) return;
     loadedTrackKeyRef.current = key;
     setLoadedTrackKey(key);
   }, []);
 
+  /**
+   * Set the deck's playback rate.
+   *
+   * YouTube documents `setPlaybackRate` as honouring only the values in
+   * `getAvailablePlaybackRates()`, and the IFrame bridge is asynchronous, so
+   * the acceptance check happens on a later tick (see `verifyPlaybackRate`)
+   * rather than immediately — reading the rate back in the same turn races
+   * the postMessage round trip and would disable steering on every browser.
+   */
+  const applyPlaybackRate = useCallback((p: YTPlayer | null, rate: number) => {
+    if (!p) return;
+    if (!p.setPlaybackRate) {
+      rateSupportedRef.current = false;
+      return;
+    }
+    if (Math.abs(playbackRateRef.current - rate) < 0.001) return;
+    try {
+      p.setPlaybackRate(rate);
+      playbackRateRef.current = rate;
+      pendingRateRef.current =
+        rate === RATE_NORMAL ? null : { rate, atMs: Date.now() };
+    } catch {
+      rateSupportedRef.current = false;
+      playbackRateRef.current = RATE_NORMAL;
+      pendingRateRef.current = null;
+    }
+  }, []);
+
+  /** Did the player actually take the rate we asked for? */
+  const verifyPlaybackRate = useCallback((p: YTPlayer | null) => {
+    const pending = pendingRateRef.current;
+    if (!pending || !p?.getPlaybackRate) return;
+    if (Date.now() - pending.atMs < 900) return;
+    pendingRateRef.current = null;
+    try {
+      const actual = p.getPlaybackRate();
+      if (Number.isFinite(actual) && Math.abs(actual - pending.rate) > 0.005) {
+        // This build only accepts its menu rates — go back to seek-only.
+        rateSupportedRef.current = false;
+        playbackRateRef.current = RATE_NORMAL;
+        p.setPlaybackRate?.(RATE_NORMAL);
+      }
+    } catch {
+      rateSupportedRef.current = false;
+    }
+  }, []);
+
+  /** A new track always starts at normal speed. */
+  const resetPlaybackRate = useCallback((p: YTPlayer | null) => {
+    pendingRateRef.current = null;
+    if (playbackRateRef.current === RATE_NORMAL) return;
+    playbackRateRef.current = RATE_NORMAL;
+    try {
+      p?.setPlaybackRate?.(RATE_NORMAL);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   /* ---------- world-clock "now" in exact UTC milliseconds ---------- */
   const worldNowMs = useCallback(() => {
     return getWorldNowMs(
-      clockStateRef.current,
+      getClockState(),
       Date.now(),
       typeof performance !== "undefined" ? performance.now() : 0
     );
@@ -428,22 +505,7 @@ export default function NowPlaying({
         const serverUtcMs = Number(data.utcMs ?? data.t);
         if (!Number.isFinite(serverUtcMs)) continue;
 
-        const sample = createClockSample(t0, t1, serverUtcMs);
-        clockSamplesRef.current = [
-          ...clockSamplesRef.current.slice(-11),
-          sample,
-        ];
-        const nextState = selectBestClockAnchor(
-          clockSamplesRef.current,
-          Date.now(),
-          performance.now()
-        );
-        clockStateRef.current = nextState;
-        setClockBadge((prev) => ({
-          ...prev,
-          synced: nextState.synced,
-          rttMs: Math.round(nextState.bestRttMs),
-        }));
+        addClockSample(t0, t1, serverUtcMs);
       } catch {
         /* keep previous anchor */
       }
@@ -476,16 +538,25 @@ export default function NowPlaying({
 
   // Fallback until the first NTP burst sample lands: use snapshot serverNow.
   useEffect(() => {
-    if (!snap || clockStateRef.current.synced) return;
-    const monoNow = typeof performance !== "undefined" ? performance.now() : 0;
-    clockStateRef.current = {
-      utcAtMonoZero: snap.serverNow - monoNow,
-      offsetMs: snap.serverNow - Date.now(),
-      bestRttMs: Infinity,
-      sampleCount: 1,
-      synced: true,
-    };
+    if (!snap) return;
+    seedClockFromServerNow(snap.serverNow);
   }, [snap]);
+
+  // Mirror the shared anchor into the badge (the room poll feeds it too).
+  useEffect(() => {
+    return subscribeClock((next) => {
+      setClockBadge((prev) =>
+        prev.synced === next.synced &&
+        prev.rttMs === Math.round(next.bestRttMs)
+          ? prev
+          : {
+              ...prev,
+              synced: next.synced,
+              rttMs: Math.round(next.bestRttMs),
+            }
+      );
+    });
+  }, []);
 
   // Forward refs so sync / rebuild / recovery can call each other cleanly.
   const syncRef = useRef<(forceSeek?: boolean) => void>(() => {});
@@ -503,9 +574,9 @@ export default function NowPlaying({
     recoveryAttemptRef.current = 0;
     lastHealthyAtRef.current = Date.now();
     clearRecoveryTimer();
-    setHealing(false);
+    setHealingState(false);
     setProblem("");
-  }, [clearRecoveryTimer, setProblem]);
+  }, [clearRecoveryTimer, setHealingState, setProblem]);
 
   /* ---------- tell the room a video simply cannot be embedded ---------- */
   const reportUnplayable = useCallback(() => {
@@ -516,11 +587,11 @@ export default function NowPlaying({
     if (unplayableReportedRef.current.has(key)) return;
     unplayableReportedRef.current.add(key);
     setProblem("");
-    setHealing(true);
+    setHealingState(true);
     onPlayerActionRef
       .current("unplayable", { queueId: np.queueId, videoId: np.videoId })
       .catch(() => undefined);
-  }, [setProblem]);
+  }, [setHealingState, setProblem]);
 
   /* ---------- the escalating recovery ladder ---------- */
   const startRecovery = useCallback(
@@ -530,7 +601,7 @@ export default function NowPlaying({
       const attempt = recoveryAttemptRef.current;
       const plan = planRecovery(kind, attempt);
       recoveryAttemptRef.current = attempt + 1;
-      setHealing(true);
+      setHealingState(true);
       if (plan.surface) {
         setProblem(
           kind === "embed-blocked"
@@ -543,7 +614,7 @@ export default function NowPlaying({
         recoveryTimerRef.current = null;
         const s = snapRef.current;
         if (!s?.nowPlaying) {
-          setHealing(false);
+          setHealingState(false);
           return;
         }
         switch (plan.step) {
@@ -573,7 +644,7 @@ export default function NowPlaying({
         }
       }, plan.delayMs);
     },
-    [reportUnplayable, setProblem]
+    [reportUnplayable, setHealingState, setProblem]
   );
 
   /* ---------- player event handlers ---------- */
@@ -939,6 +1010,8 @@ export default function NowPlaying({
       autoUnmuteTriedRef.current = false;
       driftStrikesRef.current = 0;
       pendingSeekRef.current = false;
+      resetPlaybackRate(outgoing);
+      resetPlaybackRate(incoming);
       // It is already playing, so never flash the "loading track…" overlay.
       setLoadedKey(trackKey);
 
@@ -977,7 +1050,14 @@ export default function NowPlaying({
       runCrossfade(incoming, outgoing, ms);
       return true;
     },
-    [expectedPos, resetPreload, runCrossfade, setLoadedKey, startRecovery]
+    [
+      expectedPos,
+      resetPlaybackRate,
+      resetPreload,
+      runCrossfade,
+      setLoadedKey,
+      startRecovery,
+    ]
   );
 
   /* ---------- load a track onto the live player ---------- */
@@ -999,6 +1079,7 @@ export default function NowPlaying({
       driftStrikesRef.current = 0;
       endedHoldRef.current = null;
       pendingSeekRef.current = true;
+      resetPlaybackRate(player);
       setLoadedKey(null);
 
       const expected = expectedPos();
@@ -1018,7 +1099,13 @@ export default function NowPlaying({
         startRecovery("transient");
       }
     },
-    [expectedPos, ensureAudioActive, startRecovery, setLoadedKey]
+    [
+      expectedPos,
+      ensureAudioActive,
+      resetPlaybackRate,
+      startRecovery,
+      setLoadedKey,
+    ]
   );
 
   /* ---------- sync the player with the shared world clock ---------- */
@@ -1060,7 +1147,7 @@ export default function NowPlaying({
             // Brand new song: reset every per-track flag before loading.
             recoveryAttemptRef.current = 0;
             clearRecoveryTimer();
-            setHealing(false);
+            setHealingState(false);
             setProblem("");
 
             /* Crossfade. Hand the room over to the second deck instead of
@@ -1230,8 +1317,14 @@ export default function NowPlaying({
             }
           }
 
-          // Millisecond drift tracking & corrective seek when settled
+          /* ---- drift: steer first, seek only as a last resort ----
+             A seek flushes the decoder and is audible; a 3% playback-rate
+             nudge is not (HTML5 rate changes preserve pitch). Small drift is
+             therefore steered out over a few seconds and the hard seek is
+             kept for gaps too wide to steer: a slept tab, a reconnect, a
+             manual scrub. */
           if (st === YT_STATE.PLAYING || st === YT_STATE.PAUSED) {
+            verifyPlaybackRate(player);
             const cur = player.getCurrentTime();
             if (Number.isFinite(cur)) {
               const driftSec = cur - expected;
@@ -1246,16 +1339,36 @@ export default function NowPlaying({
                 driftStrikesRef.current = 0;
               }
 
-              const cooledDown =
-                Date.now() - lastSeekAtRef.current > SEEK_COOLDOWN_MS;
-              if (
-                forceSeek ||
-                (driftStrikesRef.current >= SEEK_STRIKES_BEFORE_SEEK && cooledDown)
-              ) {
+              // Steering needs a deck that owns its own timeline: rolling,
+              // not paused, and not in the middle of a crossfade.
+              const canSteer =
+                rateSupportedRef.current &&
+                st === YT_STATE.PLAYING &&
+                party.isPlaying &&
+                !fadeRef.current &&
+                !scrubbingRef.current;
+
+              const plan = planDriftCorrection({
+                driftSec,
+                currentRate: playbackRateRef.current,
+                strikes: driftStrikesRef.current,
+                seekCooledDown:
+                  Date.now() - lastSeekAtRef.current > SEEK_COOLDOWN_MS,
+                force: forceSeek,
+                rateSupported: canSteer,
+                strikesNeeded: SEEK_STRIKES_BEFORE_SEEK,
+              });
+
+              if (plan.kind === "seek") {
+                resetPlaybackRate(player);
                 const targetSec = expected + (party.isPlaying ? SEEK_LEAD_SEC : 0);
                 player.seekTo(targetSec, true);
                 lastSeekAtRef.current = Date.now();
                 driftStrikesRef.current = 0;
+              } else if (plan.kind === "rate") {
+                applyPlaybackRate(player, plan.rate);
+              } else if (!canSteer && playbackRateRef.current !== RATE_NORMAL) {
+                resetPlaybackRate(player);
               }
             }
 
@@ -1409,7 +1522,7 @@ export default function NowPlaying({
           wantedVideoIdRef.current = null;
           setLoadedKey(null);
           clearRecoveryTimer();
-          setHealing(false);
+          setHealingState(false);
           setProblem("");
           try {
             player.stopVideo();
@@ -1436,8 +1549,12 @@ export default function NowPlaying({
       clearRecoveryTimer,
       currentPlayerVideoId,
       markHealthy,
+      setHealingState,
       setProblem,
       setLoadedKey,
+      applyPlaybackRate,
+      resetPlaybackRate,
+      verifyPlaybackRate,
     ]
   );
 
@@ -1485,14 +1602,17 @@ export default function NowPlaying({
     };
   }, [mountPlayer]);
 
-  // A new track resets per-track recovery state and syncs immediately.
+  // A new track resets per-track recovery state and syncs immediately (on
+  // the next frame — sync() sets state, and the effect phase is the one
+  // place that must not).
   useEffect(() => {
     recoveryAttemptRef.current = 0;
     lastHealthyAtRef.current = Date.now();
     setProblem("");
-    setHealing(false);
-    sync(false);
-  }, [snap?.nowPlaying?.queueId, snap?.nowPlaying?.videoId, sync]);
+    setHealingState(false);
+    const id = window.setTimeout(() => sync(false), 0);
+    return () => window.clearTimeout(id);
+  }, [snap?.nowPlaying?.queueId, snap?.nowPlaying?.videoId, setHealingState, sync]);
 
   // Keep the player tightly synced with the world clock (every 500ms).
   useEffect(() => {
@@ -1500,8 +1620,12 @@ export default function NowPlaying({
     return () => clearInterval(t);
   }, [sync]);
 
+  // A fresh snapshot is applied on the next frame rather than inside the
+  // effect itself: sync() can set state, and doing that synchronously during
+  // the effect phase cascades an extra render of the whole deck.
   useEffect(() => {
-    sync(false);
+    const id = window.setTimeout(() => sync(false), 0);
+    return () => window.clearTimeout(id);
   }, [snap, sync]);
 
   // Returning to the tab after a mobile freeze: re-check everything at once.
@@ -1668,7 +1792,7 @@ export default function NowPlaying({
         }
       } else if (action === "skip") {
         setProblem("");
-        setHealing(false);
+        setHealingState(false);
         recoveryAttemptRef.current = 0;
         clearRecoveryTimer();
       }
@@ -1710,12 +1834,29 @@ export default function NowPlaying({
     sync(true);
   };
 
+  /* Stable handles for the window-event and Media Session listeners, which
+     are registered once but must always call the current closures. */
+  const toggleMuteRef = useRef(toggleMute);
+  const seekLocalRef = useRef(seekLocal);
+  const commitSeekRef = useRef(commitSeek);
+  const runClockBurstRef = useRef(runClockBurst);
+  const displayPosRef = useRef(displayPos);
+  const isAdminRef = useRef(isAdmin);
+  useEffect(() => {
+    toggleMuteRef.current = toggleMute;
+    seekLocalRef.current = seekLocal;
+    commitSeekRef.current = commitSeek;
+    runClockBurstRef.current = runClockBurst;
+    displayPosRef.current = displayPos;
+    isAdminRef.current = isAdmin;
+  });
+
   const manualRetry = () => {
     recoveryAttemptRef.current = 0;
     clearRecoveryTimer();
     unplayableReportedRef.current.clear();
     setProblem("");
-    setHealing(true);
+    setHealingState(true);
     enableSound();
     rebuildPlayer(false);
   };
@@ -1726,6 +1867,118 @@ export default function NowPlaying({
   const progress = duration > 0 ? Math.min(1, displayPos / duration) : 0;
   const currentTrackKey = np ? `${np.queueId ?? 0}:${np.videoId}` : null;
   const switching = !!np && loadedTrackKey !== currentTrackKey;
+
+  /* ---------- room-wide shortcuts and the lock screen ----------
+     Both reach the deck through a window event instead of four more props,
+     which would re-render the whole room every time one of them changed. */
+  useEffect(() => {
+    return onRoomEvent((event) => {
+      if (event.type === "toggle-mute") {
+        toggleMuteRef.current();
+        return;
+      }
+      if (event.type === "force-resync") {
+        // The connection came back: re-anchor the clock and jump onto the
+        // room timeline rather than drifting back into it.
+        void runClockBurstRef.current(3);
+        syncRef.current(true);
+        return;
+      }
+      if (event.type === "seek-by") {
+        if (!isAdminRef.current) return;
+        const total = snapRef.current?.party.durationSec ?? 0;
+        const target = Math.max(
+          0,
+          total > 0
+            ? Math.min(total - 0.5, displayPosRef.current + event.seconds)
+            : displayPosRef.current + event.seconds
+        );
+        seekLocalRef.current(target);
+        commitSeekRef.current(target);
+      }
+    });
+  }, []);
+
+  /* ---------- Media Session: lock screen, notification, headphones ----------
+     Without this a phone shows a dead pause button and no artwork. Hosts get
+     real transport controls (they drive the whole room); guests get
+     play/pause mapped to their own speaker, which doubles as the gesture
+     that unlocks audio. */
+  useEffect(() => {
+    if (!np) {
+      clearMediaSession();
+      return;
+    }
+    setMediaSessionTrack({
+      title: np.title,
+      artist: np.artist || `added by ${np.addedByName || "the room"}`,
+      album: "vibe·room",
+      videoId: np.videoId,
+      thumbnail: np.thumbnail,
+    });
+    setMediaSessionHandlers(
+      isAdmin
+        ? {
+            onPlay: () => {
+              void onPlayerActionRef.current("resume", {
+                positionSec: displayPosRef.current,
+              });
+            },
+            onPause: () => {
+              void onPlayerActionRef.current("pause", {
+                positionSec: displayPosRef.current,
+              });
+            },
+            onNext: () => {
+              void onPlayerActionRef.current("skip");
+            },
+            onSeekBackward: (offset) => {
+              const target = Math.max(0, displayPosRef.current - offset);
+              seekLocalRef.current(target);
+              commitSeekRef.current(target);
+            },
+            onSeekForward: (offset) => {
+              const target = displayPosRef.current + offset;
+              seekLocalRef.current(target);
+              commitSeekRef.current(target);
+            },
+            onSeekTo: (position) => {
+              seekLocalRef.current(position);
+              commitSeekRef.current(position);
+            },
+          }
+        : {
+            // A guest cannot pause the party, only their own speaker.
+            onPlay: () => {
+              if (mutedRef.current) toggleMuteRef.current();
+            },
+            onPause: () => {
+              if (!mutedRef.current) toggleMuteRef.current();
+            },
+          }
+    );
+    return () => {
+      setMediaSessionHandlers({});
+    };
+  }, [np, isAdmin]);
+
+  useEffect(() => {
+    setMediaSessionPlaybackState(isPlaying);
+  }, [isPlaying]);
+
+  useEffect(() => {
+    if (!np || !duration) return;
+    const push = () =>
+      setMediaSessionPosition({
+        durationSec: duration,
+        positionSec: displayPosRef.current,
+        playbackRate: playbackRateRef.current,
+      });
+    push();
+    // The lock-screen scrubber only needs a coarse refresh.
+    const iv = window.setInterval(push, 5000);
+    return () => window.clearInterval(iv);
+  }, [np, duration, isPlaying]);
 
   const handleTilt = (e: React.MouseEvent<HTMLDivElement>) => {
     const r = e.currentTarget.getBoundingClientRect();

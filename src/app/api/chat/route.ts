@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { chatMessages, users } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { limitKey, rateLimit, RULES } from "@/lib/rate-limit";
+import { isReactionEmoji } from "@/lib/reactions";
 
 export const dynamic = "force-dynamic";
 
@@ -31,7 +33,12 @@ function isGifUrl(value: string) {
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({}));
   const userId = String(body.userId ?? "");
-  const kind = body.kind === "gif" ? "gif" : "text";
+  const kind =
+    body.kind === "gif"
+      ? "gif"
+      : body.kind === "reaction"
+        ? "reaction"
+        : "text";
   let content = String(body.content ?? "").trim();
 
   const UUID_RE =
@@ -39,9 +46,39 @@ export async function POST(req: NextRequest) {
   if (!UUID_RE.test(userId)) {
     return NextResponse.json({ ok: false, error: "Join the party first" }, { status: 401 });
   }
+
+  const rule = kind === "reaction" ? RULES.reaction : RULES.chat;
+  const verdict = rateLimit(limitKey(kind === "reaction" ? "reaction" : "chat", req.headers, userId), rule);
+  if (!verdict.allowed) {
+    return NextResponse.json(
+      { ok: false, error: "Slow down a second." },
+      { status: 429, headers: { "Retry-After": String(verdict.retryAfterSec) } }
+    );
+  }
+
   const found = await db.select().from(users).where(eq(users.id, userId));
   if (!found.length) {
     return NextResponse.json({ ok: false, error: "Join the party first" }, { status: 401 });
+  }
+
+  // Reactions are ephemeral confetti: an emoji from a fixed list, lifted out
+  // of the chat log by the snapshot and floated across every screen.
+  if (kind === "reaction") {
+    if (!isReactionEmoji(content)) {
+      return NextResponse.json(
+        { ok: false, error: "Unknown reaction." },
+        { status: 400 }
+      );
+    }
+    await db.insert(chatMessages).values({
+      userId,
+      userName: found[0].name,
+      userColor: found[0].color,
+      isAdmin: found[0].isAdmin,
+      kind: "reaction",
+      content,
+    });
+    return NextResponse.json({ ok: true });
   }
 
   if (kind === "gif") {

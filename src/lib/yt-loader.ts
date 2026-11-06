@@ -19,6 +19,10 @@ export interface YTPlayer {
   destroy(): void;
   /** Available once the player has loaded a video. */
   getVideoData?(): { video_id?: string; title?: string; author?: string };
+  /** Pitch-preserving speed control — used for inaudible drift correction. */
+  setPlaybackRate?(rate: number): void;
+  getPlaybackRate?(): number;
+  getAvailablePlaybackRates?(): number[];
   /** Module controls — used to force YouTube's own captions off. */
   loadModule?(module: string): void;
   unloadModule?(module: string): void;

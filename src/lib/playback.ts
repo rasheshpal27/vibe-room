@@ -144,6 +144,110 @@ export const MIN_CROSSFADE_TRACK_SEC = 45;
  */
 export const END_REPORT_TOLERANCE_SEC = CROSSFADE_SEC + 4;
 
+/* ------------------------------------------------------------------ *
+ * Soft drift correction
+ *
+ * The room is in sync when every deck sits on the same world-clock
+ * position. The old correction was a single blunt instrument: once the
+ * drift passed 300ms for two readings, `seekTo()` — which flushes the
+ * decoder and produces an audible hiccup, several times a song on a
+ * phone with a lazy timer.
+ *
+ * HTML5 playback rate changes are pitch-preserving, so a 3% nudge is
+ * completely inaudible: at 1.03x a deck claws back 30ms of lag every
+ * second. Small drift is therefore *steered* out, and the hard seek is
+ * reserved for gaps too large to steer (a tab that was asleep, a
+ * reconnect, a manual scrub).
+ * ------------------------------------------------------------------ */
+
+/** Below this nobody can hear the difference — do nothing at all. */
+export const DRIFT_DEADBAND_SEC = 0.3;
+/** Above this, steering would take longer than the song. Jump instead. */
+export const DRIFT_HARD_SEEK_SEC = 2.5;
+/** Playback rates used to steer. Both are inaudible and pitch-preserving. */
+export const RATE_CATCH_UP = 1.03;
+export const RATE_EASE_OFF = 0.97;
+export const RATE_NORMAL = 1;
+/** Once inside this band the deck is handed back to 1.0x. */
+export const DRIFT_SETTLED_SEC = 0.12;
+/** Float comparison slack for rates. */
+const RATE_EPSILON = 0.001;
+
+export type DriftCorrection =
+  | { kind: "none" }
+  | { kind: "rate"; rate: number }
+  | { kind: "seek" };
+
+function sameRate(a: number, b: number) {
+  return Math.abs(a - b) < RATE_EPSILON;
+}
+
+/**
+ * Decide how to answer the current drift.
+ *
+ * `driftSec` is `player - expected`: positive means this deck is AHEAD of
+ * the room and must slow down. `rateSupported` is false when the player
+ * refused a fractional rate, in which case the old seek-only ladder is
+ * used unchanged.
+ */
+export function planDriftCorrection(input: {
+  driftSec: number;
+  currentRate: number;
+  strikes: number;
+  seekCooledDown: boolean;
+  force: boolean;
+  rateSupported: boolean;
+  strikesNeeded?: number;
+}): DriftCorrection {
+  const {
+    driftSec,
+    currentRate,
+    strikes,
+    seekCooledDown,
+    force,
+    rateSupported,
+  } = input;
+  const strikesNeeded = input.strikesNeeded ?? 2;
+
+  if (force) return { kind: "seek" };
+  if (!Number.isFinite(driftSec)) return { kind: "none" };
+
+  const distance = Math.abs(driftSec);
+  const struckOut = strikes >= strikesNeeded && seekCooledDown;
+
+  // Too far gone to steer.
+  if (distance >= DRIFT_HARD_SEEK_SEC && struckOut) return { kind: "seek" };
+
+  if (!rateSupported) {
+    if (distance > DRIFT_DEADBAND_SEC && struckOut) return { kind: "seek" };
+    return { kind: "none" };
+  }
+
+  const steering = !sameRate(currentRate, RATE_NORMAL);
+
+  // Back on the beat: hand the deck back to normal speed.
+  if (steering && distance <= DRIFT_SETTLED_SEC) {
+    return { kind: "rate", rate: RATE_NORMAL };
+  }
+
+  if (distance > DRIFT_DEADBAND_SEC) {
+    const wanted = driftSec > 0 ? RATE_EASE_OFF : RATE_CATCH_UP;
+    return sameRate(currentRate, wanted)
+      ? { kind: "none" }
+      : { kind: "rate", rate: wanted };
+  }
+
+  // Inside the deadband but not yet settled: keep steering, say nothing.
+  return { kind: "none" };
+}
+
+/** Seconds of steering needed to erase `driftSec` at the given rate. */
+export function steeringSecondsFor(driftSec: number, rate: number): number {
+  const delta = Math.abs(rate - RATE_NORMAL);
+  if (delta < RATE_EPSILON) return Infinity;
+  return Math.abs(driftSec) / delta;
+}
+
 /**
  * Equal-power crossfade gains. Linear ramps dip in the middle (the two
  * signals are uncorrelated, so their powers add, not their amplitudes);
