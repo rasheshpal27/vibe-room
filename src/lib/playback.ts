@@ -109,3 +109,79 @@ export function shouldRetryLoad(opts: {
   if (!opts.shouldPlay) return false;
   return opts.playerState !== 1 && opts.playerState !== 3;
 }
+
+
+/* ------------------------------------------------------------------ *
+ * Crossfade
+ *
+ * Two songs have to overlap for the music never to stop, and every guest
+ * has to hear the same overlap. The room timeline therefore moves to the
+ * next track `CROSSFADE_SEC` before the current one runs out: the incoming
+ * song starts at position 0 on the second deck while the outgoing song
+ * plays its last seconds on the first one, fading out.
+ * ------------------------------------------------------------------ */
+
+/** Length of the audio overlap between two songs, in seconds. */
+export const CROSSFADE_SEC = 4;
+/** Fade applied when a track change was *not* a natural ending (skip, delete). */
+export const QUICK_FADE_MS = 900;
+/** Start buffering the next song this many seconds before the current ends. */
+export const PRELOAD_LEAD_SEC = 18;
+/** Never crossfade clips shorter than this — it would eat the whole track. */
+export const MIN_CROSSFADE_TRACK_SEC = 45;
+/**
+ * How early an `ended` report may legitimately arrive. One crossfade plus
+ * slack for poll latency and a slightly wrong stored duration.
+ */
+export const END_REPORT_TOLERANCE_SEC = CROSSFADE_SEC + 4;
+
+/**
+ * Equal-power crossfade gains. Linear ramps dip in the middle (the two
+ * signals are uncorrelated, so their powers add, not their amplitudes);
+ * sin/cos keeps the perceived loudness constant across the overlap.
+ */
+export function crossfadeGains(progress: number): {
+  incoming: number;
+  outgoing: number;
+} {
+  const t = Math.min(1, Math.max(0, progress));
+  return {
+    incoming: Math.sin((t * Math.PI) / 2),
+    outgoing: Math.cos((t * Math.PI) / 2),
+  };
+}
+
+/**
+ * Guard for `POST /api/player {action:"ended"}`.
+ *
+ * Clients report the end of a track themselves, and with crossfade they do
+ * it a few seconds early on purpose. A report that arrives far too early
+ * (stale client, wrong clock, bad metadata) must not cut the song off for
+ * the whole room. The player's own measured duration wins when it is
+ * shorter than the stored one — that is the "metadata lied" case, and it is
+ * exactly when the room would otherwise stall until the watchdog.
+ */
+export function shouldAcceptEndReport(input: {
+  elapsedSec: number;
+  stateDurationSec: number;
+  clientDurationSec?: number | null;
+  toleranceSec?: number;
+}): boolean {
+  const tolerance = input.toleranceSec ?? END_REPORT_TOLERANCE_SEC;
+  const stored = Number.isFinite(input.stateDurationSec)
+    ? input.stateDurationSec
+    : 0;
+  const client =
+    typeof input.clientDurationSec === "number" &&
+    Number.isFinite(input.clientDurationSec) &&
+    input.clientDurationSec >= 20
+      ? input.clientDurationSec
+      : null;
+
+  const effective =
+    client !== null && stored > 0 ? Math.min(stored, client) : client ?? stored;
+
+  // Unknown length: trust the client, the watchdog is the only alternative.
+  if (!effective || effective <= 0) return true;
+  return input.elapsedSec >= effective - tolerance;
+}
