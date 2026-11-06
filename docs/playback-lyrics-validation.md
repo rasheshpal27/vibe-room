@@ -20,23 +20,37 @@ Two persistent YouTube decks sit stacked in the poster. One owns the room's curr
 the other preloads the next one and then plays the outgoing track's tail while the two
 crossfade. Roles swap on every song change, so a hand-over costs no iframe boot and no reload.
 
+The overlap depends on exactly one thing: **the room timeline must move on while the outgoing
+deck still has audio left.** Everything else is an optimisation.
+
 | Stage | What happens |
 | --- | --- |
-| `PRELOAD_LEAD_SEC` (18s) left | the idle deck loads the next video muted, then pauses itself back at 0 the moment it reports PLAYING — `cueVideoById` does *not* fetch media, so this is the only way to have a primed decoder |
-| `CROSSFADE_SEC` (4s) left | the first client to get there reports `ended` **early**; the server promotes the next track, so the whole room moves to the new timeline at the same instant |
-| the switch | decks swap roles. The incoming deck is already rolling, so it just `playVideo()`s and ramps up while the outgoing one plays the song's last seconds and ramps down |
-| overlap | equal-power gains (`sin`/`cos`, so there is no loudness dip in the middle) over 4s, with a matching opacity cross-dissolve between the two video frames |
+| whole party | the second deck is kept alive permanently (booting it on demand is what made a skip sound like a hard cut) |
+| ~6s into a track | the next song is preloaded on the idle deck: loaded muted, then parked back at 0 as soon as it is rolling. `cueVideoById` does not fetch media, so starting-then-pausing is the only way to get a primed decoder. Readiness is polled *and* event driven — a single missed state callback used to disable the whole crossfade silently |
+| `CROSSFADE_SEC` (4s) left | the first client there reports `ended` **early**, the server promotes the next track, and every guest moves to the new timeline at the same instant. This no longer waits for the preload |
+| the switch | decks swap roles. A primed deck just resumes; a cold one loads now. Either way the outgoing deck is never touched, so its tail keeps playing |
+| overlap | the ramp waits until the incoming deck is *audibly rolling* (max `FADE_HOLD_MAX_MS`, 1.8s) with the outgoing held at full volume, then runs equal-power `sin`/`cos` gains so there is no loudness dip, with a matching opacity cross-dissolve |
 | end of fade | the outgoing deck is stopped, muted and becomes the idle deck for the next song |
 
+Remaining time is `min(room timeline, the player's own clock)` — the room's `durationSec` is only
+as good as the search provider's metadata, and when the real video is shorter the room would
+never reach the window before the sound stopped. That is what produced a "mixing" badge with no
+audible overlap.
+
+**Skips crossfade too.** A skip, a deleted current track or any other unexpected change uses
+`SKIP_FADE_MS` (2.5s) instead of the 4s tail, and because the next song is already primed from
+6s into the current one, the incoming deck normally starts immediately. If it does not, the
+outgoing song simply holds at full volume until it does.
+
 Guards:
-* No crossfade without something queued behind the current track, while paused, or for clips
+* No early switch without something queued behind the current track, while paused, or for clips
   shorter than `MIN_CROSSFADE_TRACK_SEC` (45s).
-* The early `ended` report only fires when the next song is genuinely primed, so a failed
-  preload can never cut a track short — it just falls back to a normal switch.
-* Skips, deletes and any other unexpected change get a 900ms fade instead of the 4s tail, and
-  still use the preloaded deck when it is available.
+* A fade never lasts longer than the audio the outgoing deck actually has left, so a mix can
+  never end on an abrupt cut.
 * Pausing the room, a recovery rebuild or another track change mid-fade stops the tail
   immediately; the sync loop never fights the ramp (`isFading` owns the volume).
+* If the outgoing deck has already finished (no early switch happened) there is no fade and no
+  "mixing" badge — the hand-over is just instant.
 * `shouldAcceptEndReport` (server) rejects an `ended` that arrives more than
   `CROSSFADE_SEC + 4` seconds early, so a stale client cannot cut a song in half. The player's
   own measured duration wins when it is shorter than the stored one — that is the "metadata

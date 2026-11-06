@@ -124,7 +124,16 @@ export function shouldRetryLoad(opts: {
 /** Length of the audio overlap between two songs, in seconds. */
 export const CROSSFADE_SEC = 4;
 /** Fade applied when a track change was *not* a natural ending (skip, delete). */
+export const SKIP_FADE_MS = 2500;
+/** Legacy alias kept for the hard-cut path (no second deck available). */
 export const QUICK_FADE_MS = 900;
+/**
+ * How long the outgoing song holds at full volume while the incoming deck
+ * gets going. A primed deck starts in ~100ms; a cold one (an unexpected
+ * skip) can take a second, and the old song has to cover that gap rather
+ * than let the room fall silent.
+ */
+export const FADE_HOLD_MAX_MS = 1800;
 /** Start buffering the next song this many seconds before the current ends. */
 export const PRELOAD_LEAD_SEC = 18;
 /** Never crossfade clips shorter than this — it would eat the whole track. */
@@ -149,6 +158,45 @@ export function crossfadeGains(progress: number): {
     incoming: Math.sin((t * Math.PI) / 2),
     outgoing: Math.cos((t * Math.PI) / 2),
   };
+}
+
+/**
+ * How much time is really left on this client's deck.
+ *
+ * The room timeline is authoritative for *position*, but its duration is
+ * whatever the search provider claimed. When the real video is shorter the
+ * room would never reach the crossfade window before the audio stops, so
+ * the player's own clock — ground truth for when sound ends — wins.
+ */
+export function effectiveRemainingSec(
+  serverRemainingSec: number,
+  playerRemainingSec?: number | null
+): number {
+  const candidates = [serverRemainingSec, playerRemainingSec].filter(
+    (v): v is number => typeof v === "number" && Number.isFinite(v)
+  );
+  if (!candidates.length) return Infinity;
+  return Math.min(...candidates);
+}
+
+/**
+ * Should this client move the room on early so the next song can overlap?
+ *
+ * Deliberately independent of whether the preload finished: the overlap
+ * only needs the *outgoing* deck to still have audio left, which is
+ * exactly what moving the timeline early guarantees. A cold incoming deck
+ * costs a slightly later fade-in, never silence.
+ */
+export function shouldArmEarlyEnd(input: {
+  remainingSec: number;
+  hasNext: boolean;
+  isPlaying: boolean;
+  durationSec: number;
+  alreadyReported: boolean;
+}): boolean {
+  if (!input.hasNext || !input.isPlaying || input.alreadyReported) return false;
+  if (!(input.durationSec >= MIN_CROSSFADE_TRACK_SEC)) return false;
+  return input.remainingSec <= CROSSFADE_SEC;
 }
 
 /**
