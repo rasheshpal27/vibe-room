@@ -1,10 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   AudioLines,
   Crown,
   Disc3,
+  Gauge,
   ListMusic,
   LogOut,
   MessageSquare,
@@ -32,9 +33,17 @@ import {
   connectionStatus,
   nextPollDelayMs,
   shouldForceResyncOnRecovery,
+  shouldResetClockOnRecovery,
   POLL_MS_VISIBLE,
   type ConnectionStatus,
 } from "@/lib/connection";
+import {
+  getNetworkProfile,
+  initNetworkProfile,
+  recordNetworkSample,
+  subscribeNetworkProfile,
+  toggleDataSaver,
+} from "@/lib/network-profile";
 import { createTicker, type Ticker } from "@/lib/ticker";
 import { isIdempotentAction, postJson } from "@/lib/net";
 import { emitRoomEvent } from "@/lib/room-events";
@@ -44,8 +53,8 @@ import { ytThumb, type PartySnapshot, type ReactionDTO } from "@/lib/types";
 import type { JoinedUser } from "./EntryGate";
 
 const LS_ADMIN = "vibe_admin_key";
-/** A poll that takes longer than this is a dead connection, not a slow one. */
-const POLL_TIMEOUT_MS = 8000;
+/** Allow slower links to finish a poll before declaring a dead connection. */
+const POLL_TIMEOUT_MS = 12000;
 /** Keep the merged chat log bounded, exactly like the server window. */
 const MAX_CHAT_ROWS = 60;
 type Tab = "deck" | "lyrics" | "queue" | "search" | "chat";
@@ -90,6 +99,12 @@ export default function PartyShell({
   const [hostModal, setHostModal] = useState(false);
   const [unreadChat, setUnreadChat] = useState(0);
   const [conn, setConn] = useState<ConnectionStatus>("online");
+  const netProfile = useSyncExternalStore(
+    subscribeNetworkProfile,
+    getNetworkProfile,
+    getNetworkProfile
+  );
+  const netProfileRef = useRef(netProfile);
   /** Reactions this device just sent — floated before the server echoes them. */
   const [localReactions, setLocalReactions] = useState<ReactionDTO[]>([]);
   const lastChatIdRef = useRef(0);
@@ -105,6 +120,12 @@ export default function PartyShell({
     tabRef.current = tab;
     rightTabRef.current = rightTab;
   }, [tab, rightTab]);
+
+  useEffect(() => {
+    netProfileRef.current = netProfile;
+  }, [netProfile]);
+
+  useEffect(() => initNetworkProfile(), []);
 
   /* ---------- transport ---------- */
   const snapRef = useRef<PartySnapshot | null>(null);
@@ -129,9 +150,14 @@ export default function PartyShell({
         failures: failuresRef.current,
         hidden: isHidden(),
         online: isOnline(),
+        slow: netProfileRef.current.slowNetwork,
       })
     );
   }, []);
+
+  useEffect(() => {
+    retuneTicker();
+  }, [netProfile.slowNetwork, retuneTicker]);
 
   const markPollOk = useCallback(() => {
     const failures = failuresRef.current;
@@ -142,12 +168,14 @@ export default function PartyShell({
       connRef.current = "online";
       setConn("online");
     }
-    /* Back after a gap. Everything the deck believes about the playhead was
-       extrapolated from a stale anchor, so throw the clock samples away and
-       make the player re-seek onto the room timeline instead of drifting
-       back in over the next minute. */
-    if (lastOk && shouldForceResyncOnRecovery(failures, Date.now() - lastOk)) {
+    /* Back after a real outage: only throw clock samples away after a long
+       disconnect, and only nudge the deck back to the timeline if we were
+       actually offline/blind long enough for drift to matter. */
+    const gapMs = lastOk ? Date.now() - lastOk : 0;
+    if (lastOk && shouldResetClockOnRecovery(gapMs)) {
       resetClockSamples();
+    }
+    if (lastOk && shouldForceResyncOnRecovery(failures, gapMs)) {
       emitRoomEvent({ type: "force-resync" });
     }
   }, []);
@@ -193,13 +221,16 @@ export default function PartyShell({
       }
 
       if (res.status === 304) {
+        recordNetworkSample(t1 - t0, true);
         markPollOk();
         return;
       }
       if (!res.ok) {
+        recordNetworkSample(t1 - t0, false);
         markPollFailed();
         return;
       }
+      recordNetworkSample(t1 - t0, true);
 
       etagRef.current = res.headers.get("ETag") ?? "";
       const data = (await res.json()) as PartySnapshot;
@@ -254,6 +285,7 @@ export default function PartyShell({
       seenFirstSnapRef.current = true;
       markPollOk();
     } catch {
+      recordNetworkSample(POLL_TIMEOUT_MS, false);
       markPollFailed();
     } finally {
       inFlightRef.current = false;
@@ -287,6 +319,7 @@ export default function PartyShell({
           failures: failuresRef.current,
           hidden: document.visibilityState === "hidden",
           online: navigator.onLine !== false,
+          slow: netProfileRef.current.slowNetwork,
         })
       );
       void refreshRef.current();
@@ -582,6 +615,35 @@ export default function PartyShell({
                 {snap?.users.length ?? 0} in room
               </span>
             </div>
+
+            <button
+              type="button"
+              onClick={() => toggleDataSaver()}
+              aria-pressed={netProfile.dataSaver}
+              title={
+                netProfile.dataSaver
+                  ? "Data Saver ON — low video quality, single stream & lighter polling. Click to return to Auto."
+                  : netProfile.slowNetwork
+                    ? "Smooth mode active (slow network detected) — widening drift tolerance & pausing background preloads. Click to lock Data Saver ON."
+                    : "Auto sync mode — switches to smooth playback if your connection slows down. Click to turn Data Saver ON."
+              }
+              className={`flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-semibold transition ${
+                netProfile.dataSaver
+                  ? "border-emerald-400/40 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/20"
+                  : netProfile.slowNetwork
+                    ? "border-cyan-400/35 bg-cyan-500/12 text-cyan-200 hover:bg-cyan-500/20"
+                    : "border-white/10 bg-white/5 text-zinc-300 hover:border-white/25 hover:text-white"
+              }`}
+            >
+              <Gauge className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">
+                {netProfile.dataSaver
+                  ? "Data saver"
+                  : netProfile.slowNetwork
+                    ? "Smooth"
+                    : "Saver"}
+              </span>
+            </button>
 
             {!isAdmin && (
               <button

@@ -143,11 +143,13 @@ test('connection status needs two consecutive failures before it cries wolf', ()
   assert.equal(c.connectionStatus(0, false), 'offline');
 });
 
-test('poll delay backs off exponentially, jitters, and respects the hidden floor', () => {
+test('poll delay backs off exponentially, jitters, and respects the hidden and slow floors', () => {
   const c = load('src/lib/connection.ts');
 
   assert.equal(c.nextPollDelayMs({ failures: 0, hidden: false, online: true }), 1000);
   assert.equal(c.nextPollDelayMs({ failures: 0, hidden: true, online: true }), 6000);
+  assert.equal(c.nextPollDelayMs({ failures: 0, hidden: false, online: true, slow: true }), 3000);
+  assert.equal(c.nextPollDelayMs({ failures: 0, hidden: true, online: true, slow: true }), 10000);
   assert.equal(c.nextPollDelayMs({ failures: 9, hidden: false, online: false }), 3000);
 
   // 3 failures -> 4000ms base, +/-25%.
@@ -161,16 +163,18 @@ test('poll delay backs off exponentially, jitters, and respects the hidden floor
   assert.ok(c.nextPollDelayMs({ failures: 1, hidden: true, online: true, random: 0 }) >= 6000);
 });
 
-test('recovery forces a hard resync after a real gap, not after a blip', () => {
+test('recovery forces a hard resync only after a real outage, never on slow polls or hidden tabs', () => {
   const c = load('src/lib/connection.ts');
-  // One dropped poll, picked straight back up: the deck is still accurate.
+  // Brief slow polls (5s or 10s hidden-tab cycles) must NOT trigger hard seeks.
   assert.equal(c.shouldForceResyncOnRecovery(1, 500), false, 'blip');
-  // Four seconds without a confirmed snapshot: the playhead is a guess now.
-  assert.equal(c.shouldForceResyncOnRecovery(1, 5000), true, 'four seconds blind');
-  // A hidden tab polls every 6s and never "fails", but still coasted.
-  assert.equal(c.shouldForceResyncOnRecovery(0, 10000), true, 'long quiet gap');
-  // Enough failures to have shown the reconnect banner always re-anchors.
+  assert.equal(c.shouldForceResyncOnRecovery(1, 5000), false, '5s slow poll must not hard-seek');
+  assert.equal(c.shouldForceResyncOnRecovery(0, 10000), false, '10s hidden poll must not hard-seek');
+  // A 30s+ gap or repeated poll failures do re-anchor.
+  assert.equal(c.shouldForceResyncOnRecovery(0, 35000), true, 'genuine 35s gap');
   assert.equal(c.shouldForceResyncOnRecovery(2, 0), true, 'was visibly reconnecting');
+  // Clock history survives brief slow spells and only wipes after 90s+ outages.
+  assert.equal(c.shouldResetClockOnRecovery(35000), false);
+  assert.equal(c.shouldResetClockOnRecovery(90000), true);
 });
 
 /* ------------------------------------------------------------------ net */
@@ -460,3 +464,124 @@ test('steering time is finite only while the rate is actually off 1.0x', () => {
   assert.ok(Math.abs(pb.steeringSecondsFor(0.3, 1.03) - 10) < 0.001);
   assert.ok(Math.abs(pb.steeringSecondsFor(-0.3, 0.97) - 10) < 0.001);
 });
+
+/* ------------------------------------------- slow internet & Data Saver */
+
+test('clock store retains low-RTT anchors across bursts of slow samples and resets on sleep', () => {
+  let wall = 1_700_000_000_000;
+  const fakeDate = class extends Date {
+    static now() {
+      return wall;
+    }
+  };
+  const perf = { now: () => perf.value, value: 1000 };
+  const store = load('src/lib/clock-store.ts', { performance: perf, Date: fakeDate });
+  store.resetClockSamples();
+
+  // Establish one crisp 30ms anchor.
+  store.addClockSample(1000, 1030, wall + 5000);
+  assert.equal(Math.round(store.getClockState().bestRttMs), 30);
+
+  // Flood with 20 slow 1800ms polls (more than MAX_SAMPLES = 12).
+  for (let i = 1; i <= 20; i++) {
+    wall += 2000;
+    perf.value += 2000;
+    store.addClockSample(perf.value, perf.value + 1800, wall + 5900);
+  }
+  // Low-RTT anchor must NOT be evicted by the slow burst.
+  assert.ok(store.getClockState().bestRttMs <= 40, 'low-RTT anchor preserved across slow burst');
+
+  // Simulate device sleep: Date.now jumps 60s ahead while performance.now pauses.
+  wall += 60_000;
+  store.addClockSample(perf.value, perf.value + 50, wall + 5000);
+  assert.equal(store.getClockState().sampleCount, 1, 'pre-sleep anchors cleared after clock step');
+});
+
+test('slow-network drift planning widens deadband, respects post-buffer grace, and backs off seeks', () => {
+  const pb = load('src/lib/playback.ts');
+
+  assert.equal(pb.effectiveDriftDeadband({ rateSupported: true, slowNetwork: false }), 0.3);
+  assert.equal(pb.effectiveDriftDeadband({ rateSupported: false, slowNetwork: false }), 0.55);
+  assert.equal(pb.effectiveDriftDeadband({ rateSupported: true, slowNetwork: true }), 0.6);
+  assert.equal(pb.effectiveDriftDeadband({ rateSupported: false, slowNetwork: true }), 4.0);
+
+  // Seek cooldown escalates exponentially so slow streams never loop every 5s.
+  assert.equal(pb.seekCooldownMs(0, false), 8000);
+  assert.equal(pb.seekCooldownMs(1, false), 16000);
+  assert.equal(pb.seekCooldownMs(2, false), 32000);
+  assert.equal(pb.seekCooldownMs(0, true), 20000);
+  assert.equal(pb.seekCooldownMs(1, true), 40000);
+  assert.equal(pb.seekCooldownMs(2, true), 60000);
+
+  // Under slowNetwork + seek-only, 1.5s and 3.5s buffer drifts are absorbed smoothly.
+  const slowSeek = {
+    currentRate: 1,
+    strikes: 6,
+    seekCooledDown: true,
+    force: false,
+    rateSupported: false,
+    strikesNeeded: 4,
+    slowNetwork: true,
+    postBufferHold: false,
+  };
+  assert.equal(pb.planDriftCorrection({ ...slowSeek, driftSec: -1.5 }).kind, 'none');
+  assert.equal(pb.planDriftCorrection({ ...slowSeek, driftSec: -3.5 }).kind, 'none');
+  assert.equal(pb.planDriftCorrection({ ...slowSeek, driftSec: -4.5 }).kind, 'seek');
+
+  // During post-buffer settle hold, corrective seeks are suppressed even at large drift.
+  assert.equal(
+    pb.planDriftCorrection({ ...slowSeek, driftSec: -6.0, postBufferHold: true }).kind,
+    'none'
+  );
+  // Explicit force (e.g. host scrub / manual resync) still works.
+  assert.equal(
+    pb.planDriftCorrection({ ...slowSeek, driftSec: -6.0, postBufferHold: true, force: true }).kind,
+    'seek'
+  );
+});
+
+test('network profile detects slow links, buffering stalls, latency hysteresis, and Data Saver', () => {
+  const np = load('src/lib/network-profile.ts', { navigator: undefined });
+  np.__resetNetworkProfileForTests();
+
+  // Healthy default.
+  const healthy = np.computeNetworkProfile({ preference: 'auto', ewmaRttMs: 80, recentBufferCount: 0, recentFailures: 0 });
+  assert.equal(healthy.dataSaver, false);
+  assert.equal(healthy.slowNetwork, false);
+  assert.equal(healthy.reason, 'healthy');
+
+  // Manual Data Saver locks both dataSaver and slowNetwork ON.
+  const manual = np.computeNetworkProfile({ preference: 'on', ewmaRttMs: 30, recentBufferCount: 0, recentFailures: 0 });
+  assert.equal(manual.dataSaver, true);
+  assert.equal(manual.slowNetwork, true);
+  assert.equal(manual.reason, 'manual');
+
+  // Browser Save-Data or 3g/2g triggers automatically.
+  assert.equal(
+    np.computeNetworkProfile({ preference: 'auto', saveDataHeader: true, ewmaRttMs: 50, recentBufferCount: 0, recentFailures: 0 }).dataSaver,
+    true
+  );
+  assert.equal(
+    np.computeNetworkProfile({ preference: 'auto', effectiveType: '3g', ewmaRttMs: 50, recentBufferCount: 0, recentFailures: 0 }).slowNetwork,
+    true
+  );
+
+  // Store lifecycle: 2 buffering stalls engage Smooth mode and hold through cooldown.
+  let t = 100_000;
+  np.recordBufferingStall(1500, t);
+  assert.equal(np.getNetworkProfile().slowNetwork, false);
+  np.recordBufferingStall(1500, t + 5000);
+  assert.equal(np.getNetworkProfile().slowNetwork, true);
+  assert.equal(np.getNetworkProfile().reason, 'buffering');
+
+  // Stays in Smooth mode during the 45s hold even with fast polls.
+  np.recordNetworkSample(60, true, t + 20_000);
+  assert.equal(np.getNetworkProfile().slowNetwork, true);
+
+  // Toggle Data Saver ON/OFF cleanly.
+  np.toggleDataSaver();
+  assert.equal(np.getNetworkProfile().dataSaver, true);
+  np.toggleDataSaver();
+  assert.equal(np.getNetworkProfile().preference, 'auto');
+});
+

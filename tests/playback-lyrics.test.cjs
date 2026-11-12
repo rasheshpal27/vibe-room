@@ -200,17 +200,19 @@ test('song-change failures self-heal through an escalating ladder instead of a p
   const blocked = [0, 1, 2].map((n) => planRecovery('embed-blocked', n));
   assert.deepEqual(blocked.map((p) => p.step), ['reload', 'rebuild', 'report-unplayable']);
 
-  // A track that should be playing but sits UNSTARTED gets healed...
-  assert.equal(shouldHealStall({ shouldPlay: true, playerState: -1, msSinceHealthy: 5000, recoveryPending: false }), true);
+  // A track that should be playing but sits UNSTARTED gets healed after STALL_GRACE_MS (8s)...
+  assert.equal(shouldHealStall({ shouldPlay: true, playerState: -1, msSinceHealthy: 5000, recoveryPending: false }), false, 'slow connection stays inside 8s stall grace');
+  assert.equal(shouldHealStall({ shouldPlay: true, playerState: -1, msSinceHealthy: 9000, recoveryPending: false }), true);
   // ...while buffering, an intentional pause, or a pending retry are left alone.
-  assert.equal(shouldHealStall({ shouldPlay: true, playerState: 3, msSinceHealthy: 5000, recoveryPending: false }), false);
-  assert.equal(shouldHealStall({ shouldPlay: false, playerState: 2, msSinceHealthy: 5000, recoveryPending: false }), false);
-  assert.equal(shouldHealStall({ shouldPlay: true, playerState: -1, msSinceHealthy: 5000, recoveryPending: true }), false);
+  assert.equal(shouldHealStall({ shouldPlay: true, playerState: 3, msSinceHealthy: 9000, recoveryPending: false }), false);
+  assert.equal(shouldHealStall({ shouldPlay: false, playerState: 2, msSinceHealthy: 9000, recoveryPending: false }), false);
+  assert.equal(shouldHealStall({ shouldPlay: true, playerState: -1, msSinceHealthy: 9000, recoveryPending: true }), false);
   assert.equal(shouldHealStall({ shouldPlay: true, playerState: -1, msSinceHealthy: 500, recoveryPending: false }), false);
 
-  // The new video never took: still showing the previous id -> reload it.
-  assert.equal(shouldRetryLoad({ expectedVideoId: 'new', actualVideoId: 'old', playerState: 1, shouldPlay: true, msSinceLoad: 4000 }), true);
-  assert.equal(shouldRetryLoad({ expectedVideoId: 'new', actualVideoId: 'new', playerState: 1, shouldPlay: true, msSinceLoad: 4000 }), false);
+  // The new video never took: still showing the previous id after LOAD_GRACE_MS (7s) -> reload it.
+  assert.equal(shouldRetryLoad({ expectedVideoId: 'new', actualVideoId: 'old', playerState: 1, shouldPlay: true, msSinceLoad: 4000 }), false, '4s slow load stays inside 7s grace');
+  assert.equal(shouldRetryLoad({ expectedVideoId: 'new', actualVideoId: 'old', playerState: 1, shouldPlay: true, msSinceLoad: 8000 }), true);
+  assert.equal(shouldRetryLoad({ expectedVideoId: 'new', actualVideoId: 'new', playerState: 1, shouldPlay: true, msSinceLoad: 8000 }), false);
   assert.equal(shouldRetryLoad({ expectedVideoId: 'new', actualVideoId: 'old', playerState: 1, shouldPlay: true, msSinceLoad: 200 }), false, 'grace period respected');
 });
 
@@ -390,15 +392,16 @@ test('the deck publishes the playhead instead of re-rendering the whole party', 
   assert.ok(css.includes('prefers-reduced-motion'), 'ambient animation honours the OS setting');
 });
 
-test('corrective seeks need two strikes and a cooldown so playback stops stuttering', () => {
+test('corrective seeks need strikes, cooldown backoff, and post-buffer settle so playback stops stuttering', () => {
   const code = fs.readFileSync('src/components/NowPlaying.tsx', 'utf8');
-  assert.match(code, /SEEK_TOLERANCE_SEC = 0\.3/);
-  assert.match(code, /SEEK_STRIKES_BEFORE_SEEK = 2/);
-  assert.match(code, /SEEK_COOLDOWN_MS = 2000/);
-  assert.ok(code.includes('planDriftCorrection') && code.includes('strikes: driftStrikesRef.current'),
+  assert.match(code, /SEEK_STRIKES_BEFORE_SEEK = 3/);
+  assert.match(code, /SEEK_COOLDOWN_MS = 8000/);
+  assert.ok(code.includes('effectiveDriftDeadband(') && code.includes('seekCooldownMs('),
+    'deadband and seek backoff adapt to rate support and slow networks');
+  assert.ok(code.includes('planDriftCorrection') && code.includes('strikesNeeded'),
     'the strike ladder lives in one pure, tested function');
-  assert.ok(code.includes('strikesNeeded: SEEK_STRIKES_BEFORE_SEEK'),
-    'a single noisy sample never triggers a seek');
+  assert.ok(code.includes('postBufferHold'),
+    'post-buffer settle period prevents seeking immediately after buffering');
   assert.ok(code.includes('PLAY_NUDGE_COOLDOWN_MS'), 'play() nudges are rate limited');
 });
 
@@ -407,10 +410,10 @@ test('reloading the page does not bring back the "Tap for sound" prompt', () => 
   const muteOnStart = code.slice(code.indexOf('const muteOnStart'), code.indexOf('const muteOnStart') + 220);
   assert.ok(!muteOnStart.includes('soundAllowedRef'),
     'a fresh page always tries unmuted playback instead of pre-emptively muting');
-  assert.match(code, /AUTOPLAY_BLOCK_MS = 1100/);
+  assert.match(code, /AUTOPLAY_BLOCK_MS = 1800/);
   assert.ok(code.includes('!audiblePlaybackRef.current'),
     'only the first load can fall back to muted; a slow track never silences the room');
-  const blockAt = code.indexOf('msSinceLoad > AUTOPLAY_BLOCK_MS');
+  const blockAt = code.indexOf('msSinceLoad > autoplayBlockMs');
   const ladderAt = code.indexOf('loadNeverStarted');
   assert.ok(blockAt > -1 && blockAt < ladderAt,
     'a blocked autoplay is handled before the recovery ladder can rebuild the player');
@@ -584,8 +587,8 @@ test('the room timeline moves early so every guest hears the same overlap', () =
   assert.ok(MIN_CROSSFADE_TRACK_SEC >= 45, 'short clips are never crossfaded');
 
   assert.ok(code.includes('remaining <= PRELOAD_LEAD_SEC'), 'preload is scheduled off the playhead');
-  assert.ok(code.includes('msSinceLoad > 6000 || remaining <= PRELOAD_LEAD_SEC'),
-    'the next song is also primed early so a skip can mix too');
+  assert.ok(code.includes('!slowNetwork &&') && code.includes('!dataSaver'),
+    'preloading pauses in slow / Data Saver mode so the active track stays smooth');
   assert.ok(code.includes('shouldArmEarlyEnd({'), 'the early switch is a single decision');
   assert.ok(code.includes('alreadyReported: endedReportedRef.current.has(trackKey)'),
     'reported once per track');
@@ -646,9 +649,9 @@ test('the outgoing song covers the gap when the incoming deck is cold', () => {
     'the fade never outlasts the audio the outgoing deck has left');
   assert.ok(code.includes('naturalEnd ? CROSSFADE_MS : SKIP_FADE_MS'),
     'skips crossfade too');
-  const boot = code.slice(code.indexOf('The second deck is kept alive'), code.indexOf('The second deck is kept alive') + 500);
+  const boot = code.slice(code.indexOf('!slowNetwork &&') - 20, code.indexOf('mountIdleDeck();', code.indexOf('crossfade scheduling')) + 30);
   assert.ok(boot.includes('!idlePlayerRef.current') && boot.includes('mountIdleDeck()'),
-    'the second deck exists at all times so a skip is never cold-started from nothing');
+    'on healthy connections the second deck boots early so skips crossfade too');
   assert.ok(code.includes('preloadStateRef.current = "ready"') &&
     code.includes('idleVideo === preloadedVideoRef.current'),
     'preload readiness is polled, not only event driven');
@@ -709,3 +712,44 @@ test('queue rows: the song title owns the full width of its row', () => {
   assert.ok(css.includes('(hover: hover)'),
     'touch screens keep the buttons visible in flow');
 });
+
+/* ------------------------------------------------------------------ *
+ * Round 6: smooth playback on slow connections & Data Saver mode.
+ * ------------------------------------------------------------------ */
+
+test('slow-network & Data Saver safeguards protect active buffering and cut unnecessary traffic', () => {
+  const npCode = fs.readFileSync('src/components/NowPlaying.tsx', 'utf8');
+  const shellCode = fs.readFileSync('src/components/PartyShell.tsx', 'utf8');
+  const qpCode = fs.readFileSync('src/components/QueuePanel.tsx', 'utf8');
+
+  // Focusing the browser tab must not force-seek and flush the YouTube buffer.
+  const visBlock = npCode.slice(npCode.indexOf('const onVisible ='), npCode.indexOf('const onVisible =') + 250);
+  assert.ok(visBlock.includes('sync(false)') && !visBlock.includes('sync(true)'),
+    'visibility/focus recovery inspects sync without blind forced seeking');
+
+  // Pending initial seek checks current position before flushing buffered start.
+  const pendingAt = npCode.indexOf('if (pendingSeekRef.current');
+  const pendingSeekBlock = npCode.slice(pendingAt, pendingAt + 750);
+  assert.ok(pendingSeekBlock.includes('Math.abs(cur - targetSec) > snapTol'),
+    'initial load only seeks when playback actually landed off-beat');
+
+  // Buffering stalls feed into the network profile so Smooth mode engages automatically.
+  assert.ok(npCode.includes('recordBufferingStall('), 'mid-song buffering triggers Smooth mode');
+  assert.ok(npCode.includes('DATA_SAVER_IFRAME_PX = 220') && npCode.includes('applyDataSaverQuality('),
+    'Data Saver constrains iframe viewport and hints low video quality');
+  assert.ok(npCode.includes('45_000'), 'background /api/time bursts are throttled and skipped when synced');
+
+  // Header exposes the Data Saver / Smooth toggle and passes slow status to poll cadence.
+  assert.ok(shellCode.includes('toggleDataSaver()') && shellCode.includes('slow: netProfileRef.current.slowNetwork'),
+    'PartyShell exposes Data Saver toggle and adapts poll cadence');
+  assert.ok(shellCode.includes('shouldResetClockOnRecovery('),
+    'clock samples are preserved across brief slow spells and only reset after long outages');
+
+  // Queue panel skips /api/suggestions churn on queue changes and Data Saver mode.
+  assert.ok(qpCode.includes('if (netProfile.dataSaver) return;'),
+    'Data Saver skips remote suggestion searches');
+  const sqCall = qpCode.slice(qpCode.indexOf('const suggestionQuery = buildSuggestionQuery('), qpCode.indexOf('const loadingSuggestions'));
+  assert.ok(!sqCall.includes('exclude:'),
+    'queue additions/removals do not re-fetch /api/suggestions when nowPlaying is unchanged');
+});
+

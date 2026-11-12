@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   ChevronDown,
   ChevronUp,
@@ -18,6 +18,10 @@ import {
   AudioLines,
 } from "lucide-react";
 import { SUGGESTED_SONGS } from "@/lib/constants";
+import {
+  getNetworkProfile,
+  subscribeNetworkProfile,
+} from "@/lib/network-profile";
 import { buildSongSuggestions } from "@/lib/suggestions";
 import { formatDuration, type PartySnapshot, type SongResult } from "@/lib/types";
 import type { JoinedUser } from "./EntryGate";
@@ -30,13 +34,13 @@ import type { JoinedUser } from "./EntryGate";
 export function buildSuggestionQuery(input: {
   artist?: string | null;
   title?: string | null;
-  exclude: Iterable<string>;
+  exclude?: Iterable<string>;
   seed: number;
 }): string {
   const params = new URLSearchParams();
   if (input.artist) params.set("artist", input.artist);
   if (input.title) params.set("title", input.title);
-  const exclude = Array.from(input.exclude);
+  const exclude = input.exclude ? Array.from(input.exclude) : [];
   if (exclude.length) params.set("exclude", exclude.join(","));
   params.set("seed", String(input.seed));
   return params.toString();
@@ -66,6 +70,11 @@ export default function QueuePanel({
   });
   const [suggestionSeed, setSuggestionSeed] = useState(0);
   const [scrolledUpInHistory, setScrolledUpInHistory] = useState(false);
+  const netProfile = useSyncExternalStore(
+    subscribeNetworkProfile,
+    getNetworkProfile,
+    getNetworkProfile
+  );
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const activeAnchorRef = useRef<HTMLDivElement | null>(null);
@@ -87,19 +96,18 @@ export default function QueuePanel({
   }, [snap?.nowPlaying?.videoId, snap?.queue]);
 
   /* Contextual suggestions for whatever is on the deck.
-     The spinner is *derived* — "the answer I have does not match the request
-     I would make" — rather than flipped by a setState at the top of the
-     effect, which cascades a render of the whole panel on every track. */
+     Exclude filtering runs client-side below so queue mutations don't re-hit
+     /api/suggestions when the active track hasn't changed. */
   const suggestionQuery = buildSuggestionQuery({
     artist: nowPlaying?.artist,
     title: nowPlaying?.title,
-    exclude: excludedVideoIds,
     seed: suggestionSeed,
   });
 
-  const loadingSuggestions = remote.key !== suggestionQuery;
+  const loadingSuggestions = !netProfile.dataSaver && remote.key !== suggestionQuery;
 
   useEffect(() => {
+    if (netProfile.dataSaver) return;
     let cancelled = false;
     fetch(`/api/suggestions?${suggestionQuery}`, { cache: "no-store" })
       .then((r) => (r.ok ? r.json() : { suggestions: [] }))
@@ -118,19 +126,20 @@ export default function QueuePanel({
     return () => {
       cancelled = true;
     };
-  }, [suggestionQuery]);
+  }, [suggestionQuery, netProfile.dataSaver]);
 
   const suggestions = useMemo(() => {
     const rotatedCurated = [
       ...SUGGESTED_SONGS.slice(suggestionSeed % SUGGESTED_SONGS.length),
       ...SUGGESTED_SONGS.slice(0, suggestionSeed % SUGGESTED_SONGS.length),
     ];
+    const remoteItems = netProfile.dataSaver ? [] : remote.items;
     return buildSongSuggestions(
-      [...remote.items, ...rotatedCurated],
+      [...remoteItems, ...rotatedCurated],
       excludedVideoIds,
       5
     );
-  }, [remote.items, suggestionSeed, excludedVideoIds]);
+  }, [remote.items, suggestionSeed, excludedVideoIds, netProfile.dataSaver]);
 
   // Anchor scroll position at the active/upcoming section so played songs sit
   // above and the user can scroll up to inspect played history.
