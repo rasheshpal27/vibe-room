@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   Pause,
   Play,
@@ -19,6 +19,7 @@ import {
   Shuffle,
 } from "lucide-react";
 import {
+  applyDataSaverQuality,
   createPlayer,
   disableCaptions,
   YT_STATE,
@@ -28,19 +29,33 @@ import { computeExpectedPosition, getWorldNowMs } from "@/lib/clock";
 import {
   classifyPlayerError,
   crossfadeGains,
+  effectiveDriftDeadband,
   effectiveRemainingSec,
   planRecovery,
+  seekCooldownMs,
   shouldArmEarlyEnd,
   shouldHealStall,
   shouldRetryLoad,
   planDriftCorrection,
   CROSSFADE_SEC,
   FADE_HOLD_MAX_MS,
+  LOAD_GRACE_MS,
+  LOAD_GRACE_SLOW_MS,
+  POST_BUFFER_GRACE_MS,
+  POST_BUFFER_SLOW_GRACE_MS,
   PRELOAD_LEAD_SEC,
   SKIP_FADE_MS,
+  STALL_GRACE_MS,
+  STALL_GRACE_SLOW_MS,
   RATE_NORMAL,
   type PlayerErrorKind,
 } from "@/lib/playback";
+import {
+  getNetworkProfile,
+  recordBufferingStall,
+  recordNetworkSample,
+  subscribeNetworkProfile,
+} from "@/lib/network-profile";
 import {
   installAudioUnlockListeners,
   isAudioUnlocked,
@@ -64,18 +79,18 @@ import {
 } from "@/lib/media-session";
 import { formatDuration, type PartySnapshot } from "@/lib/types";
 
-// Drift threshold against the shared world clock. Correcting below ~300ms is
-// inaudible but each seek costs a decoder flush, so an over-eager threshold
-// makes playback stutter *and* drift more. Two consecutive readings must
-// breach it before we act (hysteresis against measurement noise).
-const SEEK_TOLERANCE_SEC = 0.3;
-const SEEK_STRIKES_BEFORE_SEEK = 2;
-// Minimum time between two corrective seeks (avoids decoder stutter loops).
-const SEEK_COOLDOWN_MS = 2000;
+// Three consecutive readings outside the active deadband must breach before
+// seeking (prevents measurement noise and brief buffering from triggering seeks).
+const SEEK_STRIKES_BEFORE_SEEK = 3;
+// Minimum base cooldown between corrective seeks (escalates per seek via seekCooldownMs).
+const SEEK_COOLDOWN_MS = 8000;
 // Minimum time between two play() nudges when the player drifts out of state.
-const PLAY_NUDGE_COOLDOWN_MS = 900;
+const PLAY_NUDGE_COOLDOWN_MS = 1200;
 // How long audible autoplay may fail before we fall back to muted playback.
-const AUTOPLAY_BLOCK_MS = 1100;
+const AUTOPLAY_BLOCK_MS = 1800;
+const AUTOPLAY_BLOCK_SLOW_MS = 3200;
+// Constrain iframe viewport in Data Saver mode so YouTube ABR stays in low quality.
+const DATA_SAVER_IFRAME_PX = 220;
 // Small lead compensation (40ms) when issuing an active seek so decoder buffer
 // resume lands right on the world-clock playhead.
 const SEEK_LEAD_SEC = 0.04;
@@ -156,6 +171,46 @@ export default function NowPlaying({
   const volumeRef = useRef(80);
   const soundAllowedRef = useRef(false);
 
+  /* ---------- network & data-saver profile ---------- */
+  const networkProfile = useSyncExternalStore(
+    subscribeNetworkProfile,
+    getNetworkProfile,
+    getNetworkProfile
+  );
+  const networkProfileRef = useRef(networkProfile);
+  useEffect(() => {
+    networkProfileRef.current = networkProfile;
+    applyDataSaverQuality(playerRef.current, networkProfile.dataSaver);
+    if (
+      (networkProfile.dataSaver || networkProfile.slowNetwork) &&
+      !fadeRef.current &&
+      preloadedVideoRef.current
+    ) {
+      try {
+        idlePlayerRef.current?.stopVideo();
+      } catch {
+        /* bridge busy */
+      }
+      preloadedVideoRef.current = null;
+      preloadStateRef.current = "idle";
+    }
+  }, [networkProfile]);
+
+  const posterBoxRef = useRef<HTMLDivElement | null>(null);
+  const [posterPx, setPosterPx] = useState(0);
+  useEffect(() => {
+    const el = posterBoxRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const update = () => {
+      const w = Math.round(el.clientWidth);
+      setPosterPx((prev) => (prev === w ? prev : w));
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   /* ---------- world clock ----------
      Shared with the room poller: every /api/state response carries the
      server clock in a header, so those count as samples too and the anchor
@@ -193,6 +248,11 @@ export default function NowPlaying({
   const creatingRef = useRef(false);
   const pendingSeekRef = useRef(false);
   const lastSeekAtRef = useRef(0);
+  const seeksInTrackRef = useRef(0);
+  const lastSeenPartyUpdatedAtRef = useRef(0);
+  const bufferingStartedAtRef = useRef(0);
+  const bufferingReportedForEpisodeRef = useRef(false);
+  const lastBufferedAtRef = useRef(0);
   const driftStrikesRef = useRef(0);
   /* ---------- drift steering (soft correction) ---------- */
   /** Rate currently applied to the live deck. */
@@ -494,23 +554,27 @@ export default function NowPlaying({
   }, [ensureAudioActive]);
 
   /* ---------- Multi-sample NTP burst clock sync against UTC world clock ---------- */
-  const runClockBurst = useCallback(async (burstCount = 4) => {
+  const runClockBurst = useCallback(async (burstCount = 3) => {
     for (let i = 0; i < burstCount; i++) {
       try {
         const t0 = performance.now();
         const res = await fetch("/api/time", { cache: "no-store" });
         const t1 = performance.now();
-        if (!res.ok) continue;
+        if (!res.ok) {
+          recordNetworkSample(t1 - t0, false);
+          continue;
+        }
         const data = (await res.json()) as { utcMs?: number; t?: number };
         const serverUtcMs = Number(data.utcMs ?? data.t);
         if (!Number.isFinite(serverUtcMs)) continue;
 
+        recordNetworkSample(t1 - t0, true);
         addClockSample(t0, t1, serverUtcMs);
       } catch {
         /* keep previous anchor */
       }
       if (i < burstCount - 1) {
-        await new Promise((r) => setTimeout(r, 120));
+        await new Promise((r) => setTimeout(r, 150));
       }
     }
   }, []);
@@ -518,14 +582,24 @@ export default function NowPlaying({
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      if (!cancelled) await runClockBurst(4);
+      if (!cancelled) await runClockBurst(3);
     })();
     const iv = window.setInterval(() => {
-      if (!cancelled) runClockBurst(2);
-    }, 15000);
+      if (cancelled) return;
+      const np = networkProfileRef.current;
+      const clk = getClockState();
+      // Room polls already feed RTT samples every 1-3s; skip redundant /api/time
+      // bursts in slow/Data Saver mode or when a low-RTT anchor is already fresh.
+      if (np.slowNetwork || np.dataSaver) return;
+      if (clk.synced && clk.bestRttMs < 350) return;
+      runClockBurst(2);
+    }, 45_000);
     const onVis = () => {
-      if (document.visibilityState === "visible" && !cancelled) {
-        runClockBurst(3);
+      if (document.visibilityState !== "visible" || cancelled) return;
+      const np = networkProfileRef.current;
+      const clk = getClockState();
+      if (!np.slowNetwork && !np.dataSaver && (!clk.synced || clk.bestRttMs > 400)) {
+        runClockBurst(2);
       }
     };
     document.addEventListener("visibilitychange", onVis);
@@ -620,7 +694,7 @@ export default function NowPlaying({
         switch (plan.step) {
           case "reload":
             appliedTrackKeyRef.current = null;
-            syncRef.current(true);
+            syncRef.current(false);
             break;
           case "rebuild":
             rebuildPlayerRef.current(false);
@@ -726,15 +800,38 @@ export default function NowPlaying({
           !playing ||
           playing === wantedVideoIdRef.current;
 
+        if (onTrack && state === YT_STATE.BUFFERING) {
+          lastBufferedAtRef.current = Date.now();
+          if (
+            loadConfirmedRef.current &&
+            Date.now() - lastSeekAtRef.current > 1500 &&
+            bufferingStartedAtRef.current === 0
+          ) {
+            bufferingStartedAtRef.current = Date.now();
+            bufferingReportedForEpisodeRef.current = false;
+          }
+        }
+
         if (onTrack && (state === YT_STATE.PLAYING || state === YT_STATE.BUFFERING)) {
           loadConfirmedRef.current = true;
           // It is playing again (host scrubbed back, or a fresh load).
           endedHoldRef.current = null;
-          if (state === YT_STATE.PLAYING && !forceMutedRef.current) {
-            try {
-              if (!playerRef.current?.isMuted()) audiblePlaybackRef.current = true;
-            } catch {
-              /* bridge busy */
+          if (state === YT_STATE.PLAYING) {
+            if (bufferingStartedAtRef.current > 0) {
+              const bufDur = Date.now() - bufferingStartedAtRef.current;
+              lastBufferedAtRef.current = Date.now();
+              if (bufDur >= 1200 && !bufferingReportedForEpisodeRef.current) {
+                recordBufferingStall(bufDur);
+              }
+              bufferingStartedAtRef.current = 0;
+              bufferingReportedForEpisodeRef.current = false;
+            }
+            if (!forceMutedRef.current) {
+              try {
+                if (!playerRef.current?.isMuted()) audiblePlaybackRef.current = true;
+              } catch {
+                /* bridge busy */
+              }
             }
           }
           // Recovered via the muted fallback but audio is actually allowed?
@@ -757,6 +854,10 @@ export default function NowPlaying({
         }
 
         disableCaptions(playerRef.current);
+        applyDataSaverQuality(
+          playerRef.current,
+          networkProfileRef.current.dataSaver
+        );
         ensureAudioActive(playerRef.current);
 
         if (pendingSeekRef.current && state !== YT_STATE.CUED) {
@@ -766,8 +867,12 @@ export default function NowPlaying({
             try {
               const targetSec =
                 expectedPos() + (s.party.isPlaying ? SEEK_LEAD_SEC : 0);
-              p.seekTo(targetSec, true);
-              lastSeekAtRef.current = Date.now();
+              const cur = p.getCurrentTime?.() ?? 0;
+              const snapTol = networkProfileRef.current.slowNetwork ? 3.5 : 1.2;
+              if (!Number.isFinite(cur) || Math.abs(cur - targetSec) > snapTol) {
+                p.seekTo(targetSec, true);
+                lastSeekAtRef.current = Date.now();
+              }
             } catch {
               /* ignore */
             }
@@ -827,10 +932,11 @@ export default function NowPlaying({
             readyRef.current = true;
             lastHealthyAtRef.current = Date.now();
             disableCaptions(p);
+            applyDataSaverQuality(p, networkProfileRef.current.dataSaver);
             ensureAudioActive(p);
             setReady(true);
             setProblem("");
-            syncRef.current(true);
+            syncRef.current(false);
           },
           onStateChange: handleStateChange,
           onError: handleError,
@@ -916,6 +1022,12 @@ export default function NowPlaying({
    */
   const preloadNext = useCallback(
     (videoId: string) => {
+      if (
+        networkProfileRef.current.slowNetwork ||
+        networkProfileRef.current.dataSaver
+      ) {
+        return;
+      }
       if (fadeRef.current) return; // the idle deck is busy playing a tail
       if (preloadedVideoRef.current === videoId) return;
       mountIdleDeck();
@@ -1006,12 +1118,20 @@ export default function NowPlaying({
       wantedVideoIdRef.current = videoId;
       loadStartedAtRef.current = Date.now();
       lastHealthyAtRef.current = Date.now();
+      lastSeekAtRef.current = Date.now();
+      seeksInTrackRef.current = 0;
+      bufferingStartedAtRef.current = 0;
+      bufferingReportedForEpisodeRef.current = false;
+      lastBufferedAtRef.current = 0;
+      lastSeenPartyUpdatedAtRef.current =
+        snapRef.current?.party.updatedAtMs ?? 0;
       loadConfirmedRef.current = false;
       autoUnmuteTriedRef.current = false;
       driftStrikesRef.current = 0;
       pendingSeekRef.current = false;
       resetPlaybackRate(outgoing);
       resetPlaybackRate(incoming);
+      applyDataSaverQuality(incoming, networkProfileRef.current.dataSaver);
       // It is already playing, so never flash the "loading track…" overlay.
       setLoadedKey(trackKey);
 
@@ -1038,6 +1158,9 @@ export default function NowPlaying({
           incoming.loadVideoById({
             videoId,
             startSeconds: Math.max(0, expected + SEEK_LEAD_SEC),
+            suggestedQuality: networkProfileRef.current.dataSaver
+              ? "small"
+              : undefined,
           });
         }
         disableCaptions(incoming);
@@ -1074,6 +1197,13 @@ export default function NowPlaying({
       wantedVideoIdRef.current = videoId;
       loadStartedAtRef.current = Date.now();
       lastHealthyAtRef.current = Date.now();
+      lastSeekAtRef.current = Date.now();
+      seeksInTrackRef.current = 0;
+      bufferingStartedAtRef.current = 0;
+      bufferingReportedForEpisodeRef.current = false;
+      lastBufferedAtRef.current = 0;
+      lastSeenPartyUpdatedAtRef.current =
+        snapRef.current?.party.updatedAtMs ?? 0;
       loadConfirmedRef.current = false;
       autoUnmuteTriedRef.current = false;
       driftStrikesRef.current = 0;
@@ -1084,13 +1214,21 @@ export default function NowPlaying({
 
       const expected = expectedPos();
       const startSeconds = Math.max(0, expected + (shouldPlay ? SEEK_LEAD_SEC : 0));
+      const suggestedQuality = networkProfileRef.current.dataSaver
+        ? "small"
+        : undefined;
 
       try {
         ensureAudioActive(player);
+        applyDataSaverQuality(player, networkProfileRef.current.dataSaver);
         if (shouldPlay) {
-          player.loadVideoById({ videoId, startSeconds });
+          player.loadVideoById({ videoId, startSeconds, suggestedQuality });
         } else {
-          player.cueVideoById({ videoId, startSeconds: Math.max(0, expected) });
+          player.cueVideoById({
+            videoId,
+            startSeconds: Math.max(0, expected),
+            suggestedQuality,
+          });
         }
         disableCaptions(player);
       } catch {
@@ -1117,6 +1255,9 @@ export default function NowPlaying({
 
       const np = s.nowPlaying;
       const party = s.party;
+      const { slowNetwork, dataSaver } = networkProfileRef.current;
+      const browserOnline =
+        typeof navigator === "undefined" || navigator.onLine !== false;
 
       const player = playerRef.current;
       if (np?.videoId) {
@@ -1153,7 +1294,8 @@ export default function NowPlaying({
             /* Crossfade. Hand the room over to the second deck instead of
                tearing the audio down on this one: the outgoing song keeps
                playing (and fading) while the next one comes up, whether it
-               was preloaded or has to load right now. */
+               was preloaded or has to load right now. In slow / Data Saver
+               mode, stick to one deck to avoid dual-stream bandwidth stalls. */
             let outgoingState = -1;
             let outgoingRemaining = Infinity;
             try {
@@ -1176,6 +1318,8 @@ export default function NowPlaying({
               armedEndTrackRef.current === appliedTrackKeyRef.current ||
               outgoingRemaining <= CROSSFADE_SEC + 2.5;
             const canHandOver =
+              !slowNetwork &&
+              !dataSaver &&
               !!idlePlayerRef.current &&
               idleReadyRef.current &&
               party.isPlaying &&
@@ -1211,10 +1355,26 @@ export default function NowPlaying({
 
           ensureAudioActive(player);
 
+          /* ---- track prolonged mid-song buffering so Smooth mode engages ---- */
+          if (st === YT_STATE.BUFFERING && bufferingStartedAtRef.current > 0) {
+            lastBufferedAtRef.current = Date.now();
+            if (
+              !bufferingReportedForEpisodeRef.current &&
+              Date.now() - bufferingStartedAtRef.current >= 2500
+            ) {
+              bufferingReportedForEpisodeRef.current = true;
+              recordBufferingStall(2500);
+            }
+          }
+
           /* ---- audible autoplay refused? keep the room in sync, muted ----
              This is the only reason a guest should ever see a sound prompt,
              and it is checked before the recovery ladder so a blocked
              autoplay never triggers an iframe rebuild. */
+          const autoplayBlockMs =
+            slowNetwork || soundAllowedRef.current
+              ? AUTOPLAY_BLOCK_SLOW_MS
+              : AUTOPLAY_BLOCK_MS;
           if (
             party.isPlaying &&
             !loadConfirmedRef.current &&
@@ -1224,7 +1384,7 @@ export default function NowPlaying({
             !forceMutedRef.current &&
             !mutedRef.current &&
             volumeRef.current > 0 &&
-            msSinceLoad > AUTOPLAY_BLOCK_MS &&
+            msSinceLoad > autoplayBlockMs &&
             st !== YT_STATE.PLAYING &&
             st !== YT_STATE.BUFFERING
           ) {
@@ -1284,7 +1444,13 @@ export default function NowPlaying({
 
           /* ---- automatic healing: did the load actually take? ---- */
           const wrongVideo = !!actualVideoId && actualVideoId !== np.videoId;
+          const loadGraceMs = slowNetwork ? LOAD_GRACE_SLOW_MS : LOAD_GRACE_MS;
+          const stallGraceMs = slowNetwork
+            ? STALL_GRACE_SLOW_MS
+            : STALL_GRACE_MS;
+
           const loadNeverStarted =
+            browserOnline &&
             (!loadConfirmedRef.current || wrongVideo) &&
             shouldRetryLoad({
               expectedVideoId: np.videoId,
@@ -1292,17 +1458,20 @@ export default function NowPlaying({
               playerState: st,
               shouldPlay: party.isPlaying,
               msSinceLoad,
+              graceMs: loadGraceMs,
             });
 
           if (loadNeverStarted && recoveryTimerRef.current === null) {
             startRecovery("transient");
           } else if (
+            browserOnline &&
             !endedHold &&
             shouldHealStall({
               shouldPlay: party.isPlaying,
               playerState: st,
               msSinceHealthy: Date.now() - lastHealthyAtRef.current,
               recoveryPending: recoveryTimerRef.current !== null,
+              graceMs: stallGraceMs,
             })
           ) {
             startRecovery("transient");
@@ -1318,11 +1487,20 @@ export default function NowPlaying({
           }
 
           /* ---- drift: steer first, seek only as a last resort ----
-             A seek flushes the decoder and is audible; a 3% playback-rate
-             nudge is not (HTML5 rate changes preserve pitch). Small drift is
-             therefore steered out over a few seconds and the hard seek is
-             kept for gaps too wide to steer: a slept tab, a reconnect, a
-             manual scrub. */
+             A seek flushes YouTube's decoder buffer and forces re-buffering;
+             on slow connections, aggressive seeking causes a loop of
+             buffer -> behind -> seek -> re-buffer every few seconds.
+             Host transport jumps (`party.updatedAtMs` changing on the same
+             track) bypass cooldowns so scrubs still snap immediately. */
+          let hostSeekedNow = false;
+          if (party.updatedAtMs !== lastSeenPartyUpdatedAtRef.current) {
+            lastSeenPartyUpdatedAtRef.current = party.updatedAtMs;
+            seeksInTrackRef.current = 0;
+            lastSeekAtRef.current = 0;
+            lastBufferedAtRef.current = 0;
+            hostSeekedNow = true;
+          }
+
           if (st === YT_STATE.PLAYING || st === YT_STATE.PAUSED) {
             verifyPlaybackRate(player);
             const cur = player.getCurrentTime();
@@ -1333,12 +1511,6 @@ export default function NowPlaying({
                 prev.driftMs === driftMs ? prev : { ...prev, driftMs }
               );
 
-              if (Math.abs(driftSec) > SEEK_TOLERANCE_SEC) {
-                driftStrikesRef.current += 1;
-              } else {
-                driftStrikesRef.current = 0;
-              }
-
               // Steering needs a deck that owns its own timeline: rolling,
               // not paused, and not in the middle of a crossfade.
               const canSteer =
@@ -1348,15 +1520,42 @@ export default function NowPlaying({
                 !fadeRef.current &&
                 !scrubbingRef.current;
 
+              const postBufferHold =
+                !hostSeekedNow &&
+                Date.now() - lastBufferedAtRef.current <
+                  (slowNetwork
+                    ? POST_BUFFER_SLOW_GRACE_MS
+                    : POST_BUFFER_GRACE_MS);
+
+              const activeDeadband = effectiveDriftDeadband({
+                rateSupported: canSteer,
+                slowNetwork,
+              });
+
+              if (!postBufferHold && Math.abs(driftSec) > activeDeadband) {
+                driftStrikesRef.current += 1;
+              } else {
+                driftStrikesRef.current = 0;
+              }
+
+              const cooldownMs = Math.max(
+                SEEK_COOLDOWN_MS,
+                seekCooldownMs(seeksInTrackRef.current, slowNetwork)
+              );
+              const strikesNeeded = slowNetwork ? 4 : SEEK_STRIKES_BEFORE_SEEK;
+
               const plan = planDriftCorrection({
                 driftSec,
                 currentRate: playbackRateRef.current,
-                strikes: driftStrikesRef.current,
+                strikes: hostSeekedNow ? strikesNeeded : driftStrikesRef.current,
                 seekCooledDown:
-                  Date.now() - lastSeekAtRef.current > SEEK_COOLDOWN_MS,
-                force: forceSeek,
+                  hostSeekedNow ||
+                  Date.now() - lastSeekAtRef.current > cooldownMs,
+                force: forceSeek || (hostSeekedNow && Math.abs(driftSec) > 1.0),
                 rateSupported: canSteer,
-                strikesNeeded: SEEK_STRIKES_BEFORE_SEEK,
+                strikesNeeded,
+                slowNetwork,
+                postBufferHold,
               });
 
               if (plan.kind === "seek") {
@@ -1364,6 +1563,7 @@ export default function NowPlaying({
                 const targetSec = expected + (party.isPlaying ? SEEK_LEAD_SEC : 0);
                 player.seekTo(targetSec, true);
                 lastSeekAtRef.current = Date.now();
+                seeksInTrackRef.current += 1;
                 driftStrikesRef.current = 0;
               } else if (plan.kind === "rate") {
                 applyPlaybackRate(player, plan.rate);
@@ -1399,16 +1599,13 @@ export default function NowPlaying({
           }
 
           /* ---- crossfade scheduling ----
-             The overlap only works if every guest switches at the same
-             instant, so the room timeline itself moves CROSSFADE_SEC
-             early: whoever gets there first reports the end, the server
-             promotes the next track, and each client plays the tail of
-             the old one locally while fading it out. */
+             Skipped when slowNetwork or dataSaver is active so a second
+             YouTube stream never competes with the active song. */
           const nextUp = s.queue[0] ?? null;
 
-          // The second deck is kept alive for the whole party: booting it
-          // lazily is what made an unexpected skip sound like a hard cut.
           if (
+            !slowNetwork &&
+            !dataSaver &&
             !idlePlayerRef.current &&
             !idleCreatingRef.current &&
             loadConfirmedRef.current &&
@@ -1440,15 +1637,16 @@ export default function NowPlaying({
             st === YT_STATE.PLAYING ? playerRemaining : null
           );
 
-          if (nextUp && party.isPlaying && !endedHold) {
-            /* Preload the next song as soon as this one is settled, not
-               just before the end: that is what makes a skip crossfade
-               instead of stalling on a cold deck. */
+          if (nextUp && party.isPlaying && !endedHold && !slowNetwork && !dataSaver) {
+            /* Preload the next song only inside the PRELOAD_LEAD_SEC window
+               (and only when the current stream hasn't buffered recently) so
+               we don't saturate bandwidth or waste data on skipped tracks. */
             const wantsPreload =
               preloadedVideoRef.current !== nextUp.videoId &&
               !fadeRef.current &&
               loadConfirmedRef.current &&
-              (msSinceLoad > 6000 || remaining <= PRELOAD_LEAD_SEC) &&
+              remaining <= PRELOAD_LEAD_SEC &&
+              Date.now() - lastBufferedAtRef.current > 8000 &&
               Date.now() - lastPreloadAtRef.current > 4000;
             if (wantsPreload) {
               lastPreloadAtRef.current = Date.now();
@@ -1608,6 +1806,10 @@ export default function NowPlaying({
   useEffect(() => {
     recoveryAttemptRef.current = 0;
     lastHealthyAtRef.current = Date.now();
+    seeksInTrackRef.current = 0;
+    bufferingStartedAtRef.current = 0;
+    bufferingReportedForEpisodeRef.current = false;
+    lastBufferedAtRef.current = 0;
     setProblem("");
     setHealingState(false);
     const id = window.setTimeout(() => sync(false), 0);
@@ -1628,12 +1830,13 @@ export default function NowPlaying({
     return () => window.clearTimeout(id);
   }, [snap, sync]);
 
-  // Returning to the tab after a mobile freeze: re-check everything at once.
+  // Returning to the tab after a mobile freeze: re-check without force-seeking
+  // (focus/visibility changes shouldn't flush a healthy YouTube buffer).
   useEffect(() => {
     const onVisible = () => {
       if (document.visibilityState !== "visible") return;
       lastHealthyAtRef.current = Date.now();
-      sync(true);
+      sync(false);
     };
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onVisible);
@@ -1784,7 +1987,10 @@ export default function NowPlaying({
         if (p) {
           try {
             ensureAudioActive(p);
-            p.seekTo(displayPos + SEEK_LEAD_SEC, true);
+            const cur = p.getCurrentTime?.();
+            if (!Number.isFinite(cur) || Math.abs(cur - displayPos) > 0.5) {
+              p.seekTo(displayPos + SEEK_LEAD_SEC, true);
+            }
             p.playVideo();
           } catch {
             /* ignore */
@@ -1830,7 +2036,7 @@ export default function NowPlaying({
   };
 
   const resyncExactMs = async () => {
-    await runClockBurst(3);
+    await runClockBurst(2);
     sync(true);
   };
 
@@ -1878,9 +2084,15 @@ export default function NowPlaying({
         return;
       }
       if (event.type === "force-resync") {
-        // The connection came back: re-anchor the clock and jump onto the
-        // room timeline rather than drifting back into it.
-        void runClockBurstRef.current(3);
+        // The connection came back after a genuine outage: re-anchor the
+        // clock and jump onto the room timeline rather than drifting back.
+        if (typeof navigator !== "undefined" && navigator.onLine === false) {
+          return;
+        }
+        const isSlow =
+          networkProfileRef.current.slowNetwork ||
+          networkProfileRef.current.dataSaver;
+        void runClockBurstRef.current(isSlow ? 1 : 2);
         syncRef.current(true);
         return;
       }
@@ -1990,6 +2202,20 @@ export default function NowPlaying({
   const posterWidth =
     "mx-auto w-full max-w-[min(100%,34dvh,440px)] sm:max-w-[min(100%,38dvh,440px)] md:max-w-[min(100%,40dvh,440px)] lg:max-w-[min(100%,46dvh,460px)]";
 
+  const saverScale =
+    networkProfile.dataSaver && posterPx > DATA_SAVER_IFRAME_PX
+      ? posterPx / DATA_SAVER_IFRAME_PX
+      : 1;
+  const saverViewportStyle =
+    saverScale > 1
+      ? {
+          width: `${DATA_SAVER_IFRAME_PX}px`,
+          height: `${DATA_SAVER_IFRAME_PX}px`,
+          transform: `scale(${saverScale})`,
+          transformOrigin: "top left",
+        }
+      : undefined;
+
   return (
     <div className="flex w-full flex-col items-center justify-center animate-fade-up">
       {/* Poster / Empty Deck */}
@@ -2018,7 +2244,10 @@ export default function NowPlaying({
             transform: np ? `rotateX(${tilt.x}deg) rotateY(${tilt.y}deg)` : undefined,
           }}
         >
-          <div className="relative aspect-square w-full overflow-hidden rounded-[2.05rem] bg-black shadow-[0_40px_110px_rgba(0,0,0,0.8)]">
+          <div
+            ref={posterBoxRef}
+            className="relative aspect-square w-full overflow-hidden rounded-[2.05rem] bg-black shadow-[0_40px_110px_rgba(0,0,0,0.8)]"
+          >
             {/* Two persistent YouTube decks. One owns the current track, the
                 other preloads the next one and plays the outgoing tail, so a
                 song change cross-dissolves instead of cutting to black. */}
@@ -2029,16 +2258,22 @@ export default function NowPlaying({
             >
               <div
                 ref={hostARef}
-                className="absolute inset-0 [&>div]:h-full [&>div]:w-full [&>iframe]:h-full [&>iframe]:w-full"
+                className={`${
+                  saverScale > 1 ? "absolute left-0 top-0" : "absolute inset-0"
+                } [&>div]:h-full [&>div]:w-full [&>iframe]:h-full [&>iframe]:w-full`}
                 style={{
+                  ...saverViewportStyle,
                   opacity: activeDeck === "A" ? 1 : 0,
                   transition: `opacity ${fadeMs}ms linear`,
                 }}
               />
               <div
                 ref={hostBRef}
-                className="absolute inset-0 [&>div]:h-full [&>div]:w-full [&>iframe]:h-full [&>iframe]:w-full"
+                className={`${
+                  saverScale > 1 ? "absolute left-0 top-0" : "absolute inset-0"
+                } [&>div]:h-full [&>div]:w-full [&>iframe]:h-full [&>iframe]:w-full`}
                 style={{
+                  ...saverViewportStyle,
                   opacity: activeDeck === "B" ? 1 : 0,
                   transition: `opacity ${fadeMs}ms linear`,
                 }}

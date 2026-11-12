@@ -2,8 +2,16 @@
 
 /* Minimal typings for the YouTube IFrame Player API */
 export interface YTPlayer {
-  loadVideoById(opts: string | { videoId: string; startSeconds?: number }): void;
-  cueVideoById(videoId: string | { videoId: string; startSeconds?: number }): void;
+  loadVideoById(
+    opts:
+      | string
+      | { videoId: string; startSeconds?: number; suggestedQuality?: string }
+  ): void;
+  cueVideoById(
+    videoId:
+      | string
+      | { videoId: string; startSeconds?: number; suggestedQuality?: string }
+  ): void;
   playVideo(): void;
   pauseVideo(): void;
   stopVideo(): void;
@@ -19,6 +27,8 @@ export interface YTPlayer {
   destroy(): void;
   /** Available once the player has loaded a video. */
   getVideoData?(): { video_id?: string; title?: string; author?: string };
+  /** Advisory quality hint — used by Data Saver to prefer low-bitrate video. */
+  setPlaybackQuality?(suggestedQuality: string): void;
   /** Pitch-preserving speed control — used for inaudible drift correction. */
   setPlaybackRate?(rate: number): void;
   getPlaybackRate?(): number;
@@ -111,6 +121,23 @@ export function disableCaptions(player: YTPlayer | null | undefined) {
     player.setOption?.("captions", "track", {});
   } catch {
     /* ignore */
+  }
+}
+
+/**
+ * Hint a lower video resolution when Data Saver is active so YouTube spends
+ * bandwidth on audio rather than HD video frames. Safe no-op on builds that
+ * ignore advisory quality hints (combined with compact iframe sizing).
+ */
+export function applyDataSaverQuality(
+  player: YTPlayer | null | undefined,
+  dataSaver: boolean
+) {
+  if (!player?.setPlaybackQuality) return;
+  try {
+    player.setPlaybackQuality(dataSaver ? "small" : "default");
+  } catch {
+    /* advisory only */
   }
 }
 

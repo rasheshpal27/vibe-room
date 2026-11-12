@@ -33,11 +33,15 @@ export interface RecoveryPlan {
 }
 
 /** How long a track may sit in a non-playing state before we heal it. */
-export const STALL_GRACE_MS = 3500;
+export const STALL_GRACE_MS = 8000;
+/** Extra patience on slow networks so buffering never triggers a rebuild loop. */
+export const STALL_GRACE_SLOW_MS = 15000;
 /** Grace for a brand new load (decoder + network warm-up). */
-export const LOAD_GRACE_MS = 2600;
+export const LOAD_GRACE_MS = 7000;
+/** Extra grace for slow connections where manifests/chunks take longer. */
+export const LOAD_GRACE_SLOW_MS = 14000;
 /** Background retry cadence once the recovery card is visible. */
-export const BACKGROUND_RETRY_MS = 8000;
+export const BACKGROUND_RETRY_MS = 10000;
 
 export function classifyPlayerError(code: number): PlayerErrorKind {
   if (code === 101 || code === 150) return "embed-blocked";
@@ -56,19 +60,19 @@ export function planRecovery(
   if (kind === "embed-blocked" || kind === "missing") {
     // Video-level problems are identical for every guest: retry once (the code
     // is occasionally reported for a stale load) and then skip it for the room.
-    if (attempt <= 0) return { step: "reload", delayMs: 300, surface: false };
-    if (attempt === 1) return { step: "rebuild", delayMs: 600, surface: false };
+    if (attempt <= 0) return { step: "reload", delayMs: 450, surface: false };
+    if (attempt === 1) return { step: "rebuild", delayMs: 900, surface: false };
     return {
       step: "report-unplayable",
-      delayMs: 400,
+      delayMs: 500,
       surface: attempt > 2,
     };
   }
 
-  if (attempt <= 0) return { step: "reload", delayMs: 350, surface: false };
-  if (attempt === 1) return { step: "rebuild", delayMs: 700, surface: false };
+  if (attempt <= 0) return { step: "reload", delayMs: 600, surface: false };
+  if (attempt === 1) return { step: "rebuild", delayMs: 1200, surface: false };
   if (attempt === 2)
-    return { step: "rebuild-muted", delayMs: 1200, surface: false };
+    return { step: "rebuild-muted", delayMs: 1600, surface: false };
   // Keep healing forever in the background, but let the user retry/skip too.
   return { step: "rebuild", delayMs: BACKGROUND_RETRY_MS, surface: true };
 }
@@ -145,25 +149,40 @@ export const MIN_CROSSFADE_TRACK_SEC = 45;
 export const END_REPORT_TOLERANCE_SEC = CROSSFADE_SEC + 4;
 
 /* ------------------------------------------------------------------ *
- * Soft drift correction
+ * Soft drift correction & slow-network smoothness
  *
  * The room is in sync when every deck sits on the same world-clock
- * position. The old correction was a single blunt instrument: once the
- * drift passed 300ms for two readings, `seekTo()` — which flushes the
- * decoder and produces an audible hiccup, several times a song on a
- * phone with a lazy timer.
+ * position. A seek flushes YouTube's decoder buffer and forces re-buffering
+ * over the network; on a slow connection, aggressive seeking causes an
+ * infinite loop of buffer -> behind -> seek -> re-buffer every few seconds.
  *
- * HTML5 playback rate changes are pitch-preserving, so a 3% nudge is
- * completely inaudible: at 1.03x a deck claws back 30ms of lag every
- * second. Small drift is therefore *steered* out, and the hard seek is
- * reserved for gaps too large to steer (a tab that was asleep, a
- * reconnect, a manual scrub).
+ * Therefore:
+ *  - When fractional playback rates work, steer gently at 0.97x / 1.03x.
+ *  - When only seekTo() is available, keep a wider tolerance, wait for
+ *    buffering to settle (`postBufferHold`), and back off cooldowns
+ *    exponentially between seeks in the same track.
+ *  - When slow internet / Data Saver is active, prioritize uninterrupted
+ *    playback (`SLOW_SEEK_DEADBAND_SEC = 4.0s`) over sub-second lockstep.
  * ------------------------------------------------------------------ */
 
 /** Below this nobody can hear the difference — do nothing at all. */
 export const DRIFT_DEADBAND_SEC = 0.3;
+/** Normal seek-only tolerance when YouTube rejects fractional playback rates. */
+export const SEEK_ONLY_DEADBAND_SEC = 0.55;
+/** Rate-steering deadband on a slow / jittery connection. */
+export const SLOW_RATE_DEADBAND_SEC = 0.6;
+/**
+ * Seek deadband on slow / buffering connections: absorb 1-3.9s buffer pauses
+ * without flushing the YouTube buffer and killing the vibe.
+ */
+export const SLOW_SEEK_DEADBAND_SEC = 4.0;
 /** Above this, steering would take longer than the song. Jump instead. */
 export const DRIFT_HARD_SEEK_SEC = 2.5;
+/** Hard seek threshold on slow connections. */
+export const SLOW_HARD_SEEK_SEC = 5.0;
+/** Settle window after buffering before any corrective seek is allowed. */
+export const POST_BUFFER_GRACE_MS = 6000;
+export const POST_BUFFER_SLOW_GRACE_MS = 10000;
 /** Playback rates used to steer. Both are inaudible and pitch-preserving. */
 export const RATE_CATCH_UP = 1.03;
 export const RATE_EASE_OFF = 0.97;
@@ -182,13 +201,37 @@ function sameRate(a: number, b: number) {
   return Math.abs(a - b) < RATE_EPSILON;
 }
 
+export function effectiveDriftDeadband(opts: {
+  rateSupported: boolean;
+  slowNetwork: boolean;
+}): number {
+  if (opts.slowNetwork) {
+    return opts.rateSupported ? SLOW_RATE_DEADBAND_SEC : SLOW_SEEK_DEADBAND_SEC;
+  }
+  return opts.rateSupported ? DRIFT_DEADBAND_SEC : SEEK_ONLY_DEADBAND_SEC;
+}
+
+/**
+ * Escalating cooldown between corrective seeks on the same track.
+ * Prevents the "adjusts every 5 seconds" thrash on slow connections.
+ */
+export function seekCooldownMs(
+  seeksInTrack: number,
+  slowNetwork: boolean
+): number {
+  const n = Math.max(0, seeksInTrack);
+  if (slowNetwork) {
+    return Math.min(60_000, 20_000 * Math.pow(2, Math.min(n, 2)));
+  }
+  return Math.min(45_000, 8_000 * Math.pow(2, Math.min(n, 3)));
+}
+
 /**
  * Decide how to answer the current drift.
  *
  * `driftSec` is `player - expected`: positive means this deck is AHEAD of
  * the room and must slow down. `rateSupported` is false when the player
- * refused a fractional rate, in which case the old seek-only ladder is
- * used unchanged.
+ * refused a fractional rate, in which case the seek ladder is used.
  */
 export function planDriftCorrection(input: {
   driftSec: number;
@@ -198,6 +241,8 @@ export function planDriftCorrection(input: {
   force: boolean;
   rateSupported: boolean;
   strikesNeeded?: number;
+  slowNetwork?: boolean;
+  postBufferHold?: boolean;
 }): DriftCorrection {
   const {
     driftSec,
@@ -206,6 +251,8 @@ export function planDriftCorrection(input: {
     seekCooledDown,
     force,
     rateSupported,
+    slowNetwork = false,
+    postBufferHold = false,
   } = input;
   const strikesNeeded = input.strikesNeeded ?? 2;
 
@@ -213,13 +260,21 @@ export function planDriftCorrection(input: {
   if (!Number.isFinite(driftSec)) return { kind: "none" };
 
   const distance = Math.abs(driftSec);
-  const struckOut = strikes >= strikesNeeded && seekCooledDown;
+  const struckOut =
+    strikes >= strikesNeeded && seekCooledDown && !postBufferHold;
+  const hardSeekSec = slowNetwork ? SLOW_HARD_SEEK_SEC : DRIFT_HARD_SEEK_SEC;
+  const rateDeadband = slowNetwork
+    ? SLOW_RATE_DEADBAND_SEC
+    : DRIFT_DEADBAND_SEC;
+  const seekDeadband = slowNetwork
+    ? SLOW_SEEK_DEADBAND_SEC
+    : SEEK_ONLY_DEADBAND_SEC;
 
   // Too far gone to steer.
-  if (distance >= DRIFT_HARD_SEEK_SEC && struckOut) return { kind: "seek" };
+  if (distance >= hardSeekSec && struckOut) return { kind: "seek" };
 
   if (!rateSupported) {
-    if (distance > DRIFT_DEADBAND_SEC && struckOut) return { kind: "seek" };
+    if (distance > seekDeadband && struckOut) return { kind: "seek" };
     return { kind: "none" };
   }
 
@@ -230,7 +285,7 @@ export function planDriftCorrection(input: {
     return { kind: "rate", rate: RATE_NORMAL };
   }
 
-  if (distance > DRIFT_DEADBAND_SEC) {
+  if (distance > rateDeadband) {
     const wanted = driftSec > 0 ? RATE_EASE_OFF : RATE_CATCH_UP;
     return sameRate(currentRate, wanted)
       ? { kind: "none" }
